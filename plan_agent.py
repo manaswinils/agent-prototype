@@ -1,0 +1,221 @@
+"""Plan agent: explores a repo with Claude and writes plan.md.
+
+The plan() function accepts an already-cloned repo_path so the caller
+(pipeline.py) can share one clone across the PLAN and IMPLEMENT stages.
+
+Usage (standalone):
+    python plan_agent.py "add a /health endpoint" --repo manaswinils/agent-sandbox
+
+Required env vars:
+    ANTHROPIC_API_KEY
+    GITHUB_TOKEN
+    GITHUB_USERNAME
+    GITHUB_REPO  (default if --repo not provided)
+"""
+import argparse
+import os
+import shutil
+import tempfile
+from pathlib import Path
+
+from anthropic import Anthropic
+from dotenv import load_dotenv
+
+from tools import ToolExecutor
+
+load_dotenv()
+
+PLAN_MODEL = "claude-opus-4-6"
+MAX_PLAN_ITERATIONS = 20
+
+# Read-only tool schemas — no write_file or run_command in the exploration loop.
+# This guarantees Claude fully explores before committing to a plan.
+PLAN_TOOL_SCHEMAS = [
+    {
+        "name": "list_files",
+        "description": "List files and directories at a given path inside the repo.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Relative path inside the repo. Use '.' for root."}
+            },
+            "required": ["path"],
+        },
+    },
+    {
+        "name": "read_file",
+        "description": "Read the full contents of a file inside the repo.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Relative path to the file from repo root."}
+            },
+            "required": ["path"],
+        },
+    },
+]
+
+PLAN_SYSTEM_PROMPT = """You are a senior software architect performing codebase analysis.
+Your job: thoroughly explore the repository, then produce a structured implementation plan.
+
+Use list_files and read_file to understand the repo. Read every file likely to be affected
+by the goal. When you have sufficient understanding, produce the plan.
+
+Output ONLY the plan.md content — nothing before or after it. It must start exactly with:
+# Implementation Plan: <goal verbatim>
+
+Structure:
+
+# Implementation Plan: <goal>
+
+## Overview
+2-3 sentences describing what will be done and why.
+
+## Files to Create
+| File | Purpose |
+|------|---------|
+| path/to/file.py | one-line description |
+
+## Files to Modify
+| File | Change Required |
+|------|----------------|
+| existing.py | describe the change |
+
+## Implementation Approach
+1. Numbered step-by-step implementation strategy.
+2. Be specific about function names, patterns to follow, and conventions to match.
+
+## Test Strategy
+- What to unit test
+- What to functionally test
+- How to validate the change works end-to-end
+
+## Risks and Assumptions
+- Risk or assumption 1
+- Risk or assumption 2
+"""
+
+
+def _summarize_input(tool_input: dict) -> str:
+    parts = []
+    for k, v in tool_input.items():
+        s = str(v)
+        if len(s) > 60:
+            s = s[:60] + "..."
+        parts.append(f"{k}={s!r}")
+    return ", ".join(parts)
+
+
+def run_plan_loop(client: Anthropic, executor: ToolExecutor, goal: str) -> str:
+    """Run the Claude exploration + planning loop. Returns the raw plan content."""
+    messages = [{"role": "user", "content": f"Goal: {goal}\n\nExplore the repo and produce plan.md."}]
+    final_text = ""
+
+    for iteration in range(1, MAX_PLAN_ITERATIONS + 1):
+        print(f"[plan] iter {iteration} — calling Claude ...")
+        response = client.messages.create(
+            model=PLAN_MODEL,
+            max_tokens=4096,
+            system=PLAN_SYSTEM_PROMPT,
+            tools=PLAN_TOOL_SCHEMAS,
+            messages=messages,
+        )
+        messages.append({"role": "assistant", "content": response.content})
+
+        for block in response.content:
+            if block.type == "text" and block.text.strip():
+                final_text = block.text.strip()
+
+        if response.stop_reason == "end_turn":
+            print("[plan] exploration complete.")
+            return final_text
+
+        tool_results = []
+        for block in response.content:
+            if block.type == "tool_use":
+                print(f"[plan] tool: {block.name}({_summarize_input(block.input)})")
+                result = executor.dispatch(block.name, block.input)
+                tool_results.append({
+                    "type": "tool_result",
+                    "tool_use_id": block.id,
+                    "content": result,
+                })
+
+        if not tool_results:
+            print("[plan] no tools used and not end_turn — stopping.")
+            return final_text
+
+        messages.append({"role": "user", "content": tool_results})
+
+    print(f"[plan] hit max iterations ({MAX_PLAN_ITERATIONS}).")
+    return final_text
+
+
+def plan(
+    goal: str,
+    token: str,
+    repo_full_name: str,
+    username: str,
+    repo_path: Path,
+) -> str:
+    """
+    Explore the cloned repo and produce plan.md inside it.
+
+    Args:
+        goal: Natural language goal.
+        token: GitHub PAT (unused here, accepted for interface consistency).
+        repo_full_name: e.g. 'owner/repo'.
+        username: GitHub username.
+        repo_path: Path to the already-cloned local repo.
+
+    Returns:
+        The plan content string (also written to repo_path/plan.md).
+    """
+    client = Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+    executor = ToolExecutor(repo_path)
+
+    print(f"[plan] exploring {repo_full_name} for goal: {goal[:80]}")
+    raw = run_plan_loop(client, executor, goal)
+
+    # Extract from the plan heading onward
+    marker = "# Implementation Plan:"
+    idx = raw.find(marker)
+    if idx == -1:
+        raise ValueError(
+            f"plan.md missing '{marker}' heading. "
+            f"Raw response (first 300 chars): {raw[:300]}"
+        )
+    plan_content = raw[idx:].strip()
+
+    plan_path = repo_path / "plan.md"
+    plan_path.write_text(plan_content, encoding="utf-8")
+    print(f"[plan] plan.md written ({len(plan_content)} chars)")
+
+    return plan_content
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Plan agent — writes plan.md for a goal")
+    parser.add_argument("goal", help="Natural language goal")
+    parser.add_argument("--repo", default=None, help="owner/repo (default: GITHUB_REPO env var)")
+    args = parser.parse_args()
+
+    from agent import clone_repo
+
+    token = os.environ["GITHUB_TOKEN"]
+    username = os.environ["GITHUB_USERNAME"]
+    repo = args.repo or os.environ["GITHUB_REPO"]
+
+    repo_path = clone_repo(repo, token, username)
+    try:
+        plan_content = plan(args.goal, token, repo, username, repo_path)
+        print("\n" + "=" * 60)
+        print(plan_content[:1000])
+        if len(plan_content) > 1000:
+            print(f"... ({len(plan_content)} chars total, see plan.md)")
+    finally:
+        shutil.rmtree(repo_path, ignore_errors=True)
+
+
+if __name__ == "__main__":
+    main()
