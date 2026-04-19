@@ -116,7 +116,7 @@ def generate_deploy_commands(deploy_md_content: str, tag: str) -> dict:
     return commands
 
 
-def run_command(cmd: str, timeout: int = 300) -> tuple[int, str]:
+def run_command(cmd: str, timeout: int = 300, cwd: str | None = None) -> tuple[int, str]:
     """
     Run a shell command with live output streaming.
     Returns (exit_code, full_output).
@@ -132,6 +132,7 @@ def run_command(cmd: str, timeout: int = 300) -> tuple[int, str]:
             stderr=subprocess.STDOUT,
             text=True,
             bufsize=1,
+            cwd=cwd,
         )
 
         # Stream output line by line
@@ -200,9 +201,11 @@ def deploy(repo_path: Path) -> bool:
         print(f"[deploy] failed to generate commands: {e}")
         return False
 
+    repo_cwd = str(repo_path)
+
     # Step 1: build and push image
     print("\n[deploy] --- BUILD ---")
-    exit_code, output = run_command(commands["build_command"], timeout=600)
+    exit_code, output = run_command(commands["build_command"], timeout=600, cwd=repo_cwd)
     if exit_code != 0:
         print(f"[deploy] build failed (exit {exit_code})")
         return False
@@ -210,7 +213,7 @@ def deploy(repo_path: Path) -> bool:
 
     # Step 2: update Container App
     print("\n[deploy] --- DEPLOY ---")
-    exit_code, output = run_command(commands["deploy_command"], timeout=120)
+    exit_code, output = run_command(commands["deploy_command"], timeout=120, cwd=repo_cwd)
     if exit_code != 0:
         print(f"[deploy] deploy failed (exit {exit_code})")
         print(f"[deploy] rollback: re-run deploy with previous tag")
