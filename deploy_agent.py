@@ -177,9 +177,67 @@ def verify_health(url: str, retries: int = 5, delay: float = 10.0) -> bool:
     return False
 
 
+# ── rollback helpers ──────────────────────────────────────────────────────────
+
+def get_current_image_tag(commands: dict, cwd: str | None = None) -> str | None:
+    """
+    Query the tag of the currently-running image in Azure Container Apps.
+    Parses --name and --resource-group from the deploy_command.
+    Returns the tag string (e.g. "20260419-223451") or None on failure.
+    """
+    deploy_cmd = commands.get("deploy_command", "")
+    m_name = re.search(r"--name\s+(\S+)", deploy_cmd)
+    m_rg = re.search(r"--resource-group\s+(\S+)", deploy_cmd)
+    if not m_name or not m_rg:
+        print("[deploy] could not parse app name/resource-group from deploy_command")
+        return None
+
+    app_name = m_name.group(1)
+    resource_group = m_rg.group(1)
+    query_cmd = (
+        f"az containerapp show --name {app_name} --resource-group {resource_group} "
+        f'--query "properties.template.containers[0].image" -o tsv'
+    )
+    # Run silently — suppress per-line streaming for this short query
+    try:
+        import subprocess as _sp
+        result = _sp.run(
+            query_cmd, shell=True, capture_output=True, text=True, timeout=30, cwd=cwd
+        )
+        if result.returncode != 0:
+            print(f"[deploy] get_current_image_tag query failed: {result.stderr.strip()}")
+            return None
+        image = result.stdout.strip()
+        if ":" in image:
+            tag = image.split(":")[-1]
+            print(f"[deploy] current image tag: {tag}")
+            return tag
+    except Exception as e:
+        print(f"[deploy] get_current_image_tag error: {e}")
+    return None
+
+
+def rollback_deploy(commands: dict, previous_tag: str, cwd: str | None = None) -> bool:
+    """
+    Roll back the Container App to a previous image tag.
+    Substitutes previous_tag into the stored deploy_command and re-runs it.
+    Returns True if the rollback command succeeded.
+    """
+    deploy_cmd = commands.get("deploy_command", "")
+    # Replace tag portion in --image flag (everything after the last colon in the image ref)
+    rollback_cmd = re.sub(r"(--image\s+\S+:)\S+", rf"\g<1>{previous_tag}", deploy_cmd)
+    print(f"\n[deploy] --- ROLLBACK to {previous_tag} ---")
+    exit_code, _ = run_command(rollback_cmd, timeout=120, cwd=cwd)
+    if exit_code == 0:
+        print(f"[deploy] rollback succeeded. Running tag: {previous_tag}")
+    else:
+        print(f"[deploy] rollback failed (exit {exit_code}). Manual intervention required.")
+    return exit_code == 0
+
+
 # ── main deploy function ──────────────────────────────────────────────────────
 
-def deploy(repo_path: Path) -> bool:
+def deploy(repo_path: Path) -> tuple[bool, str | None, str | None, dict | None, str | None]:
     """
     Full deploy pipeline: read deploy.md → Claude → az acr build →
     az containerapp update → health check.
@@ -188,7 +246,9 @@ def deploy(repo_path: Path) -> bool:
         repo_path: Path to local clone of the target repo (deploy.md must exist).
 
     Returns:
-        True if deploy + health check succeeded, False otherwise.
+        (success, tag, health_url, commands, previous_tag)
+        commands is kept for rollback use by the caller.
+        previous_tag is the tag that was live before this deploy (may be None).
     """
     deploy_md = read_deploy_md(repo_path)
 
@@ -199,26 +259,28 @@ def deploy(repo_path: Path) -> bool:
         commands = generate_deploy_commands(deploy_md, tag)
     except (ValueError, Exception) as e:
         print(f"[deploy] failed to generate commands: {e}")
-        return False
+        return False, None, None, None, None
 
     repo_cwd = str(repo_path)
 
+    # Query currently-deployed tag before we overwrite it
+    previous_tag = get_current_image_tag(commands, cwd=repo_cwd)
+
     # Step 1: build and push image
     print("\n[deploy] --- BUILD ---")
-    exit_code, output = run_command(commands["build_command"], timeout=600, cwd=repo_cwd)
+    exit_code, _ = run_command(commands["build_command"], timeout=600, cwd=repo_cwd)
     if exit_code != 0:
         print(f"[deploy] build failed (exit {exit_code})")
-        return False
-    print(f"[deploy] build succeeded")
+        return False, tag, commands.get("health_url"), commands, previous_tag
+    print("[deploy] build succeeded")
 
     # Step 2: update Container App
     print("\n[deploy] --- DEPLOY ---")
-    exit_code, output = run_command(commands["deploy_command"], timeout=120, cwd=repo_cwd)
+    exit_code, _ = run_command(commands["deploy_command"], timeout=120, cwd=repo_cwd)
     if exit_code != 0:
         print(f"[deploy] deploy failed (exit {exit_code})")
-        print(f"[deploy] rollback: re-run deploy with previous tag")
-        return False
-    print(f"[deploy] deploy command succeeded")
+        return False, tag, commands.get("health_url"), commands, previous_tag
+    print("[deploy] deploy command succeeded")
 
     # Step 3: health check
     print("\n[deploy] --- HEALTH CHECK ---")
@@ -228,11 +290,10 @@ def deploy(repo_path: Path) -> bool:
         print(f"\n[deploy] ✅ Deployment complete. Tag: {tag}")
         print(f"[deploy]    URL: {commands['health_url']}")
     else:
-        print(f"\n[deploy] ⚠️  Deployment may have issues. Check the app manually.")
+        print(f"\n[deploy] ⚠️  Deployment may have issues. Check manually.")
         print(f"[deploy]    URL: {commands['health_url']}")
-        print(f"[deploy]    To rollback, redeploy with the previous image tag.")
 
-    return healthy
+    return healthy, tag, commands["health_url"], commands, previous_tag
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
@@ -245,7 +306,7 @@ def main() -> None:
     args = parser.parse_args()
 
     repo_path = Path(args.repo_path).resolve()
-    success = deploy(repo_path)
+    success, tag, health_url, _commands, _prev = deploy(repo_path)
     raise SystemExit(0 if success else 1)
 
 
