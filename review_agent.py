@@ -162,10 +162,25 @@ def post_inline_comments(
 
 
 def submit_review(pr, summary: str, verdict: str) -> None:
-    """Submit the overall review (APPROVE or REQUEST_CHANGES)."""
+    """Submit the overall review (APPROVE or REQUEST_CHANGES).
+
+    GitHub does not allow REQUEST_CHANGES on your own PR — falls back to COMMENT
+    so the pipeline can continue even when the same token opens and reviews the PR.
+    """
     event = "APPROVE" if verdict == "APPROVE" else "REQUEST_CHANGES"
-    pr.create_review(body=f"🤖 **AI Code Review**\n\n{summary}", event=event)
-    print(f"[review] submitted {event} review")
+    try:
+        pr.create_review(body=f"🤖 **AI Code Review**\n\n{summary}", event=event)
+        print(f"[review] submitted {event} review")
+    except GithubException as e:
+        if "own pull request" in str(e).lower():
+            print(f"[review] cannot {event} on own PR — falling back to COMMENT")
+            pr.create_review(
+                body=f"🤖 **AI Code Review** _(verdict: {verdict})_\n\n{summary}",
+                event="COMMENT",
+            )
+            print(f"[review] submitted COMMENT review (verdict: {verdict})")
+        else:
+            raise
 
 
 def enable_automerge(pr, pr_number: int) -> None:

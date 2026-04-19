@@ -190,10 +190,19 @@ def _summarize_input(tool_input: dict) -> str:
     return ", ".join(parts)
 
 
+def _clean_pycache(repo_path: Path) -> None:
+    """Remove __pycache__ dirs and .pyc files before staging."""
+    for pycache in repo_path.rglob("__pycache__"):
+        shutil.rmtree(pycache, ignore_errors=True)
+    for pyc in repo_path.rglob("*.pyc"):
+        pyc.unlink(missing_ok=True)
+
+
 def commit_and_push_new_branch(repo_path: Path, branch: str, commit_message: str) -> bool:
     """For new PRs: create a branch, commit, push. Returns True if there were changes."""
     repo = Repo(repo_path)
     repo.git.checkout("-b", branch)
+    _clean_pycache(repo_path)
     if not repo.is_dirty(untracked_files=True):
         print("[git] no changes to commit.")
         return False
@@ -207,6 +216,7 @@ def commit_and_push_new_branch(repo_path: Path, branch: str, commit_message: str
 def commit_and_push_existing_branch(repo_path: Path, commit_message: str) -> bool:
     """For PR iterations: commit on current branch and push. Returns True if there were changes."""
     repo = Repo(repo_path)
+    _clean_pycache(repo_path)
     if not repo.is_dirty(untracked_files=True):
         print("[git] no changes to commit.")
         return False
