@@ -2,6 +2,7 @@
 import argparse
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import uuid
@@ -268,6 +269,89 @@ def merge_pr(token: str, repo_full_name: str, pr_number: int) -> bool:
     except GithubException as e:
         print(f"[merge] direct merge failed: {e}")
         return False
+
+
+def create_github_issue(token: str, repo_full_name: str, title: str, body: str) -> str:
+    """Create a GitHub issue. Returns the issue HTML URL."""
+    gh = Github(token)
+    issue = gh.get_repo(repo_full_name).create_issue(title=title, body=body)
+    print(f"[issue] created: {issue.html_url}")
+    return issue.html_url
+
+
+def revert_merge_on_main(
+    token: str, repo_full_name: str, pr_number: int, username: str
+) -> tuple[bool, str]:
+    """
+    Revert the squash-merge of pr_number from main.
+    Opens a revert branch, creates a revert commit, auto-merges it.
+    Returns (success, revert_pr_url).
+    """
+    from github import GithubException
+
+    gh = Github(token)
+    repo = gh.get_repo(repo_full_name)
+    original_pr = repo.get_pull(pr_number)
+    merge_sha = original_pr.merge_commit_sha
+
+    if not merge_sha:
+        print(f"[revert] PR #{pr_number} has no merge_commit_sha — cannot revert")
+        return False, ""
+
+    print(f"[revert] reverting commit {merge_sha[:8]} (PR #{pr_number}) from main ...")
+
+    revert_branch = f"revert/pr-{pr_number}-{merge_sha[:8]}"
+    repo_path = clone_repo(repo_full_name, token, username)
+    try:
+        git_repo = Repo(repo_path)
+        git_repo.git.checkout("-b", revert_branch)
+        # subprocess revert so we get proper exit code and stdout
+        result = subprocess.run(
+            ["git", "revert", merge_sha, "--no-edit"],
+            cwd=str(repo_path),
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            print(f"[revert] git revert failed: {result.stderr.strip()}")
+            return False, ""
+        git_repo.git.push("--set-upstream", "origin", revert_branch)
+        print(f"[revert] pushed revert branch: {revert_branch}")
+    finally:
+        shutil.rmtree(repo_path, ignore_errors=True)
+
+    revert_pr = repo.create_pull(
+        title=f"Revert: PR #{pr_number} (production E2E failure)",
+        body=(
+            f"Automatic revert of #{pr_number} due to E2E test failures in production.\n\n"
+            f"See the linked GitHub issue for failure details."
+        ),
+        head=revert_branch,
+        base=repo.default_branch,
+    )
+    print(f"[revert] opened revert PR: {revert_pr.html_url}")
+
+    try:
+        result = revert_pr.merge(
+            merge_method="squash",
+            commit_title=f"Revert: PR #{pr_number} (production E2E failure)",
+        )
+        if result.merged:
+            print(f"[revert] ✅ revert merged to main")
+        else:
+            print(f"[revert] merge returned merged=False: {result.message}")
+    except GithubException as e:
+        if "own pull request" in str(e).lower():
+            # Try enabling auto-merge instead
+            try:
+                revert_pr.enable_automerge(merge_method="SQUASH")
+                print(f"[revert] auto-merge enabled for revert PR")
+            except GithubException:
+                print(f"[revert] could not auto-merge revert PR — merge manually: {revert_pr.html_url}")
+        else:
+            print(f"[revert] merge error: {e}")
+
+    return True, revert_pr.html_url
 
 
 def request_re_review(token: str, repo_full_name: str, pr_number: int, reviewer_logins: list[str], team_slugs: list[str]) -> None:

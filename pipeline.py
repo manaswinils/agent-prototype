@@ -29,6 +29,7 @@ import subprocess
 import sys
 import uuid
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 
 from anthropic import Anthropic
@@ -39,13 +40,15 @@ from agent import (
     comment_on_pr,
     commit_and_push_existing_branch,
     commit_and_push_new_branch,
+    create_github_issue,
     fetch_pr_context,
     format_pr_context_for_prompt,
     merge_pr,
     open_pull_request,
+    revert_merge_on_main,
     run_agent_loop,
 )
-from deploy_agent import deploy, get_current_image_tag, rollback_deploy
+from deploy_agent import build_image, deploy_to, generate_all_commands, read_deploy_md, rollback_to
 from plan_agent import plan
 from review_agent import review_pr
 from tools import ToolExecutor
@@ -142,12 +145,20 @@ class PipelineState:
     test_passed: bool = False
     review_verdict: str = "PENDING"
     resolve_iterations: int = 0
-    deployed: bool = False
+    # Deploy state (shared commands — build once, deploy to staging then prod)
     deploy_tag: str | None = None
-    deploy_health_url: str | None = None
     deploy_commands: dict | None = None
-    previous_deploy_tag: str | None = None
-    e2e_passed: bool = False
+    # Staging
+    staging_deployed: bool = False
+    previous_staging_tag: str | None = None
+    staging_e2e_passed: bool = False
+    # Production
+    prod_deployed: bool = False
+    previous_prod_tag: str | None = None
+    prod_e2e_passed: bool = False
+    # Commit
+    merged: bool = False
+    failure_issue_url: str | None = None
 
 
 # ── local test stage ──────────────────────────────────────────────────────────
@@ -261,19 +272,20 @@ def run_test_stage(repo_path: Path) -> bool:
 
 # ── E2E test stage ────────────────────────────────────────────────────────────
 
-def run_e2e_stage(repo_path: Path, health_url: str) -> tuple[bool, list[str]]:
+def run_e2e_tests(repo_path: Path, health_url: str, env_label: str) -> tuple[bool, list[str], str]:
     """
-    Run Puppeteer E2E tests against the live URL.
-    Installs node deps, runs tests/e2e/test_e2e.js.
-    Returns (passed, issues_list). Skips gracefully if tests/e2e/ not present.
+    Run Puppeteer E2E tests against health_url.
+    env_label is "staging" or "prod" (for logging only).
+    Returns (passed, issues_list, full_output).
+    Skips gracefully (returns True) if tests/e2e/test_e2e.js is not present.
     """
     e2e_dir = repo_path / "tests" / "e2e"
     test_file = e2e_dir / "test_e2e.js"
     if not e2e_dir.exists() or not test_file.exists():
-        print("[e2e] tests/e2e/test_e2e.js not found — skipping E2E stage.")
-        return True, []
+        print(f"[e2e-{env_label}] tests/e2e/test_e2e.js not found — skipping.")
+        return True, [], ""
 
-    print("[e2e] installing node dependencies ...")
+    print(f"[e2e-{env_label}] installing node dependencies ...")
     subprocess.run(
         ["npm", "install", "--prefer-offline", "--no-audit", "--no-fund"],
         cwd=str(e2e_dir),
@@ -281,7 +293,7 @@ def run_e2e_stage(repo_path: Path, health_url: str) -> tuple[bool, list[str]]:
         capture_output=True,
     )
 
-    print(f"[e2e] running test_e2e.js against {health_url} ...")
+    print(f"[e2e-{env_label}] running test_e2e.js against {health_url} ...")
     result = subprocess.run(
         ["node", "test_e2e.js", health_url],
         cwd=str(e2e_dir),
@@ -291,17 +303,17 @@ def run_e2e_stage(repo_path: Path, health_url: str) -> tuple[bool, list[str]]:
     )
     output = result.stdout + ("\n" + result.stderr if result.stderr else "")
     print(output[-4000:])
-    print(f"[e2e] exit code: {result.returncode}")
+    print(f"[e2e-{env_label}] exit code: {result.returncode}")
 
     passed = result.returncode == 0
     issues: list[str] = []
     if not passed:
         for line in output.splitlines():
             stripped = line.strip()
-            if stripped.startswith("[") and "]" in stripped:
+            if stripped.startswith("  ✗") or (stripped.startswith("[") and "]" in stripped):
                 issues.append(stripped)
 
-    return passed, issues
+    return passed, issues, output
 
 
 # ── pipeline ──────────────────────────────────────────────────────────────────
@@ -406,74 +418,165 @@ def run_pipeline(state: PipelineState, max_resolve: int = MAX_RESOLVE_ITERATIONS
         finally:
             shutil.rmtree(test_path, ignore_errors=True)
 
-    # ── STAGE 7: DEPLOY (from PR branch, before merge) ──────────────────────
-    stage(7, "DEPLOY")
-    deploy_path = clone_repo(
+    # ── STAGE 7: BUILD + DEPLOY TO STAGING (from PR branch) ─────────────────
+    stage(7, "BUILD + DEPLOY TO STAGING")
+    staging_path = clone_repo(
         state.repo_full_name, state.token, state.username, branch=state.branch
     )
     try:
-        success, tag, health_url, commands, previous_tag = deploy(deploy_path)
-        state.deployed = success
-        state.deploy_tag = tag
-        state.deploy_health_url = health_url
-        state.deploy_commands = commands
-        state.previous_deploy_tag = previous_tag
-    finally:
-        shutil.rmtree(deploy_path, ignore_errors=True)
+        deploy_md = read_deploy_md(staging_path)
+        state.deploy_tag = datetime.now().strftime("%Y%m%d-%H%M%S")
+        state.deploy_commands = generate_all_commands(deploy_md, state.deploy_tag)
 
-    if not state.deployed:
-        print("[pipeline] WARN: deployment failed — skipping E2E and aborting.")
+        # Build image once — reused for both staging and prod
+        if not build_image(state.deploy_commands, cwd=str(staging_path)):
+            print("[pipeline] Build failed — aborting.")
+            _print_summary(state)
+            sys.exit(1)
+
+        # Deploy to staging
+        state.staging_deployed, state.previous_staging_tag = deploy_to(
+            state.deploy_commands, "staging", cwd=str(staging_path)
+        )
+    finally:
+        shutil.rmtree(staging_path, ignore_errors=True)
+
+    if not state.staging_deployed:
+        print("[pipeline] Staging deploy failed — aborting.")
         _print_summary(state)
         sys.exit(1)
 
-    # ── STAGE 8: E2E TEST ────────────────────────────────────────────────────
-    stage(8, "E2E TEST")
-    e2e_path = clone_repo(
+    # ── STAGE 8: E2E TEST (STAGING) ──────────────────────────────────────────
+    stage(8, "E2E TEST — STAGING")
+    staging_e2e_path = clone_repo(
         state.repo_full_name, state.token, state.username, branch=state.branch
     )
     try:
-        state.e2e_passed, e2e_issues = run_e2e_stage(e2e_path, state.deploy_health_url)
+        staging_url = state.deploy_commands["staging_health_url"]
+        state.staging_e2e_passed, staging_issues, staging_output = run_e2e_tests(
+            staging_e2e_path, staging_url, "staging"
+        )
     finally:
-        shutil.rmtree(e2e_path, ignore_errors=True)
+        shutil.rmtree(staging_e2e_path, ignore_errors=True)
 
-    if not state.e2e_passed:
-        print(f"\n[pipeline] E2E FAILED — {len(e2e_issues)} issue(s) found:")
-        for issue in e2e_issues:
+    if not state.staging_e2e_passed:
+        print(f"\n[pipeline] Staging E2E FAILED — {len(staging_issues)} issue(s):")
+        for issue in staging_issues:
             print(f"  {issue}")
-        print("\n[pipeline] Rolling back deployment ...")
-        if state.deploy_commands and state.previous_deploy_tag:
-            rollback_deploy(state.deploy_commands, state.previous_deploy_tag)
+        print("\n[pipeline] Rolling back staging ...")
+        if state.previous_staging_tag:
+            rollback_to(state.deploy_commands, "staging", state.previous_staging_tag)
         else:
-            print("[pipeline] No previous tag available — rollback skipped.")
-        print("[pipeline] Code NOT merged to main. Fix E2E issues and re-run.")
+            print("[pipeline] No previous staging tag — rollback skipped.")
+        print("[pipeline] Code NOT merged to main. Fix issues and re-run the pipeline.")
         _print_summary(state)
         sys.exit(1)
 
-    print(f"[pipeline] E2E tests passed ✅")
+    print("[pipeline] Staging E2E passed ✅")
 
-    # ── STAGE 9: COMMIT (only after E2E passes) ──────────────────────────────
+    # ── STAGE 9: COMMIT (only after staging E2E passes) ──────────────────────
     stage(9, "COMMIT")
-    merged = merge_pr(state.token, state.repo_full_name, state.pr_number)
-    if not merged:
+    state.merged = merge_pr(state.token, state.repo_full_name, state.pr_number)
+    if not state.merged:
         print("[pipeline] WARN: merge may be pending auto-merge or failed.")
 
+    # ── STAGE 10: DEPLOY TO PROD (from main branch) ──────────────────────────
+    stage(10, "DEPLOY TO PROD")
+    prod_path = clone_repo(state.repo_full_name, state.token, state.username)
+    try:
+        state.prod_deployed, state.previous_prod_tag = deploy_to(
+            state.deploy_commands, "prod", cwd=str(prod_path)
+        )
+    finally:
+        shutil.rmtree(prod_path, ignore_errors=True)
+
+    if not state.prod_deployed:
+        print("[pipeline] Prod deploy/health check failed.")
+        print("[pipeline] Main branch was merged but prod is unhealthy.")
+        _print_summary(state)
+        sys.exit(1)
+
+    # ── STAGE 11: E2E TEST (PROD) ─────────────────────────────────────────────
+    stage(11, "E2E TEST — PROD")
+    prod_e2e_path = clone_repo(state.repo_full_name, state.token, state.username)
+    try:
+        prod_url = state.deploy_commands["prod_health_url"]
+        state.prod_e2e_passed, prod_issues, prod_output = run_e2e_tests(
+            prod_e2e_path, prod_url, "prod"
+        )
+    finally:
+        shutil.rmtree(prod_e2e_path, ignore_errors=True)
+
+    if not state.prod_e2e_passed:
+        print(f"\n[pipeline] Prod E2E FAILED — {len(prod_issues)} issue(s):")
+        for issue in prod_issues:
+            print(f"  {issue}")
+
+        # Rollback prod
+        print("\n[pipeline] Rolling back production ...")
+        if state.previous_prod_tag:
+            rollback_to(state.deploy_commands, "prod", state.previous_prod_tag)
+        else:
+            print("[pipeline] No previous prod tag — rollback skipped.")
+
+        # Revert main branch
+        print("\n[pipeline] Reverting main branch ...")
+        reverted, revert_pr_url = revert_merge_on_main(
+            state.token, state.repo_full_name, state.pr_number, state.username
+        )
+
+        # Create GitHub issue with all failure details
+        issue_title = f"🚨 Prod E2E failure: {state.goal[:60]} (PR #{state.pr_number})"
+        issue_body = (
+            f"## Production E2E Test Failure\n\n"
+            f"**Goal:** {state.goal}\n"
+            f"**PR:** {state.pr_url}\n"
+            f"**Deploy tag:** `{state.deploy_tag}`\n\n"
+            f"## Failed Tests\n\n"
+            + "\n".join(f"- {i}" for i in prod_issues)
+            + f"\n\n## Full E2E Output\n\n```\n{prod_output[-3000:]}\n```\n\n"
+            f"## Actions Taken\n\n"
+            f"- {'✅' if state.previous_prod_tag else '⚠️'} Prod rolled back"
+            + (f" to `{state.previous_prod_tag}`" if state.previous_prod_tag else " (no previous tag)")
+            + f"\n- {'✅' if reverted else '❌'} Main branch revert"
+            + (f" PR: {revert_pr_url}" if revert_pr_url else " failed")
+            + f"\n\n## Next Steps\n\n"
+            f"1. Investigate the failures above\n"
+            f"2. Fix the issue in a new branch\n"
+            f"3. Re-run the pipeline\n"
+        )
+        state.failure_issue_url = create_github_issue(
+            state.token, state.repo_full_name, issue_title, issue_body
+        )
+        print(f"\n[pipeline] GitHub issue: {state.failure_issue_url}")
+        _print_summary(state)
+        sys.exit(1)
+
+    print("[pipeline] Prod E2E passed ✅")
     _print_summary(state)
 
 
 def _print_summary(state: PipelineState) -> None:
+    tag = state.deploy_tag or "N/A"
     print(f"\n{'=' * 60}")
     print("=== PIPELINE COMPLETE ===")
     print(f"{'=' * 60}")
-    print(f"Goal:      {state.goal}")
-    print(f"PR:        {state.pr_url or 'N/A'}")
-    print(f"Tests:     {'✅ PASSED' if state.test_passed else '⚠️  FAILED'}")
-    print(f"Review:    {'✅ APPROVED' if state.review_verdict == 'APPROVE' else '❌ ' + state.review_verdict} "
+    print(f"Goal:          {state.goal}")
+    print(f"PR:            {state.pr_url or 'N/A'}")
+    print(f"Unit Tests:    {'✅ PASSED' if state.test_passed else '⚠️  FAILED'}")
+    print(f"Review:        {'✅ APPROVED' if state.review_verdict == 'APPROVE' else '❌ ' + state.review_verdict} "
           f"(iteration {state.resolve_iterations})")
-    print(f"Deployed:  {'✅ ' + (state.deploy_tag or '') if state.deployed else '❌ FAILED'}")
-    print(f"E2E:       {'✅ PASSED' if state.e2e_passed else '❌ FAILED (rolled back)'}")
-    print(f"Merged:    {'✅' if state.e2e_passed and state.deployed else '⚠️  NOT merged (E2E or deploy failed)'}")
-    if state.deploy_health_url:
-        print(f"URL:       {state.deploy_health_url}")
+    print(f"Staging:       {'✅ deployed' if state.staging_deployed else '❌ FAILED'} "
+          f"({'E2E ✅' if state.staging_e2e_passed else 'E2E ❌'})")
+    print(f"Merged:        {'✅' if state.merged else '❌ NOT merged'}")
+    print(f"Prod:          {'✅ deployed' if state.prod_deployed else '❌ FAILED'} "
+          f"({'E2E ✅' if state.prod_e2e_passed else 'E2E ❌ (rolled back)'})")
+    print(f"Tag:           {tag}")
+    if state.deploy_commands:
+        print(f"Staging URL:   {state.deploy_commands.get('staging_health_url', 'N/A')}")
+        print(f"Prod URL:      {state.deploy_commands.get('prod_health_url', 'N/A')}")
+    if state.failure_issue_url:
+        print(f"Issue:         {state.failure_issue_url}")
     print(f"{'=' * 60}\n")
 
 
