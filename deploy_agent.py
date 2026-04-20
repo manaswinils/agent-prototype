@@ -34,11 +34,13 @@ SYSTEM_PROMPT = """You are a deployment automation assistant.
 You will receive a deploy.md configuration document and a deployment tag.
 Generate the exact shell commands to build and deploy the application to both staging and production.
 
+IMPORTANT: append "--output none" to both deploy commands to suppress verbose JSON output.
+
 Respond with ONLY a JSON object — no prose, no code fences:
 {
   "build_command": "<full az acr build command with <TAG> replaced by the provided tag>",
-  "staging_deploy_command": "<full az containerapp update for staging with <TAG> replaced>",
-  "prod_deploy_command": "<full az containerapp update for production with <TAG> replaced>",
+  "staging_deploy_command": "<full az containerapp update for staging with <TAG> replaced, ending with --output none>",
+  "prod_deploy_command": "<full az containerapp update for production with <TAG> replaced, ending with --output none>",
   "staging_health_url": "<staging health check URL from deploy.md>",
   "prod_health_url": "<production health check URL from deploy.md>"
 }"""
