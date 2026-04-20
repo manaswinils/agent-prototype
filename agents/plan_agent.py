@@ -71,6 +71,12 @@ START by reading these living context documents — they capture accumulated pro
   - docs/DECISIONS.md    past architectural decisions and their rationale (learn from these)
   - docs/deploy.md       deployment configuration and infrastructure constraints
 
+Then read targeted path-based rules for the files this goal will touch:
+  - docs/rules/app.md        if the goal touches app.py (routes, client, error handling)
+  - docs/rules/tests.md      if the goal touches tests/ (mocking, fixtures, coverage)
+  - docs/rules/templates.md  if the goal touches templates/ (selectors, form, escaping)
+  - docs/rules/harness.md    if the goal touches harness/ (scripts, fitness functions)
+
 After reading context files, use list_files and read_file to explore source files
 affected by the goal. When you have sufficient understanding, produce the plan.
 

@@ -4,6 +4,8 @@ Stages:
   1.  PLAN                — plan_agent reads living docs, explores repo, writes plan.md
   2.  IMPLEMENT           — coding agent reads living docs + plan.md, implements, opens PR
   3.  TEST                — generate + run pytest tests locally (non-fatal)
+  2.5 HARNESS             — lint (ruff/mypy) + fitness functions; results posted as PR comment
+  3.  TEST                — generate + run pytest tests locally (non-fatal; replaces old stage 3)
   4.  REVIEW              — review_agent reads CLAUDE.md+ARCHITECTURE.md+TEST.md, reviews PR
   5.  RESOLVE COMMENTS    — coding agent addresses feedback, resolve_all_review_threads (if needed)
   6.  TEST AFTER RESOLVE  — re-run tests on updated branch (if needed)
@@ -279,6 +281,85 @@ def run_test_stage(repo_path: Path) -> bool:
     return result.returncode == 0
 
 
+# ── harness checks stage ──────────────────────────────────────────────────────
+
+def run_harness_checks(repo_path: Path, token: str, repo_full_name: str, pr_number: int) -> dict:
+    """
+    Run lint.sh and fitness.py from the repo's harness/ directory.
+    Posts results as a PR comment (non-blocking — pipeline continues regardless).
+    Returns a dict with keys: lint_passed, fitness_passed, lint_output, fitness_output.
+    Skips gracefully if harness/ scripts are absent.
+    """
+    results = {"lint_passed": True, "fitness_passed": True, "lint_output": "", "fitness_output": ""}
+
+    lint_script = repo_path / "harness" / "lint.sh"
+    fitness_script = repo_path / "harness" / "fitness.py"
+
+    comment_parts: list[str] = ["## 🔍 Harness Report\n"]
+
+    # Run lint
+    if lint_script.exists():
+        print("[harness] running lint.sh ...")
+        try:
+            # Install ruff + mypy if available
+            subprocess.run(
+                [sys.executable, "-m", "pip", "install", "ruff", "mypy", "--quiet"],
+                cwd=repo_path, check=False, capture_output=True,
+            )
+            lint_result = subprocess.run(
+                ["bash", "harness/lint.sh"],
+                cwd=repo_path, capture_output=True, text=True, timeout=120,
+            )
+            results["lint_output"] = lint_result.stdout + lint_result.stderr
+            results["lint_passed"] = lint_result.returncode == 0
+            status = "✅ PASSED" if results["lint_passed"] else "⚠️ ISSUES FOUND"
+            comment_parts.append(
+                f"### Lint ({status})\n```\n{results['lint_output'][-1500:]}\n```\n"
+            )
+        except Exception as e:
+            print(f"[harness] lint failed with exception: {e}")
+            comment_parts.append(f"### Lint\n⚠️ lint.sh error: {e}\n")
+    else:
+        print("[harness] harness/lint.sh not found — skipping lint")
+        comment_parts.append("### Lint\n_harness/lint.sh not present in this repo_\n")
+
+    # Run fitness functions
+    if fitness_script.exists():
+        print("[harness] running harness/fitness.py ...")
+        try:
+            fitness_result = subprocess.run(
+                [sys.executable, "harness/fitness.py"],
+                cwd=repo_path, capture_output=True, text=True, timeout=60,
+            )
+            results["fitness_output"] = fitness_result.stdout + fitness_result.stderr
+            results["fitness_passed"] = fitness_result.returncode == 0
+            status = "✅ PASSED" if results["fitness_passed"] else "⚠️ VIOLATIONS"
+            comment_parts.append(
+                f"### Architecture Fitness ({status})\n```\n{results['fitness_output'][-1500:]}\n```\n"
+            )
+        except Exception as e:
+            print(f"[harness] fitness failed with exception: {e}")
+            comment_parts.append(f"### Architecture Fitness\n⚠️ fitness.py error: {e}\n")
+    else:
+        print("[harness] harness/fitness.py not found — skipping fitness checks")
+        comment_parts.append("### Architecture Fitness\n_harness/fitness.py not present in this repo_\n")
+
+    overall = "✅ All harness checks passed" if (results["lint_passed"] and results["fitness_passed"]) \
+        else "⚠️ Some harness checks found issues (non-blocking — pipeline continues)"
+    comment_parts.append(f"\n---\n_{overall}_")
+
+    # Post as PR comment
+    try:
+        comment_on_pr(token, repo_full_name, pr_number, "\n".join(comment_parts))
+        print("[harness] results posted as PR comment")
+    except Exception as e:
+        print(f"[harness] could not post PR comment: {e}")
+
+    print(f"[harness] lint={'PASSED' if results['lint_passed'] else 'ISSUES'}, "
+          f"fitness={'PASSED' if results['fitness_passed'] else 'VIOLATIONS'}")
+    return results
+
+
 # ── E2E test stage ────────────────────────────────────────────────────────────
 
 def run_e2e_tests(repo_path: Path, health_url: str, env_label: str) -> tuple[bool, list[str], str]:
@@ -352,6 +433,11 @@ def run_pipeline(state: PipelineState, max_resolve: int = MAX_RESOLVE_ITERATIONS
         f"  - docs/DECISIONS.md        past architectural decisions — respect and follow these\n"
         f"  - docs/deploy.md           deployment configuration\n"
         f"  - plan.md                  the implementation plan for this goal\n\n"
+        f"Also read targeted rules for the files you plan to modify:\n"
+        f"  - docs/rules/app.md        if touching app.py (routes, error handling, client usage)\n"
+        f"  - docs/rules/tests.md      if touching tests/ (mocking, fixtures, coverage)\n"
+        f"  - docs/rules/templates.md  if touching templates/ (selectors, form structure, escaping)\n"
+        f"  - docs/rules/harness.md    if touching harness/ (script conventions, fitness checks)\n\n"
         f"Plan summary:\n{state.plan_content[:2000]}"
     )
     executor = ToolExecutor(state.repo_path)
@@ -378,6 +464,10 @@ def run_pipeline(state: PipelineState, max_resolve: int = MAX_RESOLVE_ITERATIONS
     )
     state.pr_number = int(state.pr_url.rstrip("/").split("/")[-1])
     print(f"[pipeline] PR #{state.pr_number}: {state.pr_url}")
+
+    # ── STAGE 2.5: HARNESS (lint + fitness) ─────────────────────────────────
+    print(f"\n{'=' * 60}\n=== STAGE 2.5: HARNESS — lint + fitness functions ===\n{'=' * 60}\n")
+    run_harness_checks(state.repo_path, state.token, state.repo_full_name, state.pr_number)
 
     # ── STAGE 3: TEST (first run) ────────────────────────────────────────────
     stage(3, "TEST")
