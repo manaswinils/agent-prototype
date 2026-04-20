@@ -41,6 +41,9 @@ Rules:
 - Prefer the smallest change that works. Do not refactor unrelated code.
 - If the goal is ambiguous, make a reasonable choice and note the assumption in your summary.
 - If you are iterating on an existing PR, focus only on addressing the feedback. Do not revisit unrelated parts of the PR.
+- Do NOT touch tests/e2e/ — E2E tests are maintained separately by the pipeline.
+- Do NOT touch tests/conftest.py — shared fixtures are managed by the test agent.
+- If a file is too large to write in one response, write it in logical sections (e.g. write the top half then the bottom half in separate write_file calls to the same path — the second call will overwrite, so include the full content each time). Better yet, keep new files under 200 lines.
 """
 
 
@@ -149,7 +152,7 @@ def run_agent_loop(client: Anthropic, executor: ToolExecutor, goal: str) -> str:
         print(f"\n[iter {iteration}] calling Claude ...")
         response = client.messages.create(
             model=MODEL,
-            max_tokens=4096,
+            max_tokens=8192,
             system=SYSTEM_PROMPT,
             tools=TOOL_SCHEMAS,
             messages=messages,

@@ -148,7 +148,16 @@ class ToolExecutor:
             if tool_name == "read_file":
                 return self.read_file(tool_input["path"])
             if tool_name == "write_file":
-                return self.write_file(tool_input["path"], tool_input["content"])
+                path = tool_input.get("path", "")
+                content = tool_input.get("content")
+                if content is None:
+                    return (
+                        f"Error: write_file called without 'content' for '{path}'. "
+                        "This happens when the file content is too large to fit in one response. "
+                        "Split the file into smaller logical sections and write each part separately, "
+                        "OR write a shorter version of the file."
+                    )
+                return self.write_file(path, content)
             if tool_name == "run_command":
                 return self.run_command(tool_input["command"])
             return f"Error: unknown tool '{tool_name}'"
