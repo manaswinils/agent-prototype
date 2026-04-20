@@ -129,6 +129,10 @@ def post_inline_comments(
     for item in inline_comments:
         file_path = item.get("file", "")
         line = item.get("line")
+        try:
+            line = int(line) if line is not None else None
+        except (ValueError, TypeError):
+            line = None
         comment = item.get("comment", "")
 
         if not file_path or not line or not comment:
