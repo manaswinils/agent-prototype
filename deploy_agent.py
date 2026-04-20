@@ -154,12 +154,12 @@ def run_command(cmd: str, timeout: int = 300, cwd: str | None = None) -> tuple[i
         return 1, str(e)
 
 
-def verify_health(url: str, retries: int = 5, delay: float = 10.0) -> bool:
+def verify_health(url: str, retries: int = 5, delay: float = 10.0, timeout: int = 30) -> bool:
     """HTTP GET the URL, expect 200. Retries with delay. Returns True if healthy."""
     print(f"[deploy] verifying health: {url}")
     for attempt in range(1, retries + 1):
         try:
-            req = urllib.request.urlopen(url, timeout=15)
+            req = urllib.request.urlopen(url, timeout=timeout)
             if req.status == 200:
                 print(f"[deploy] health check passed (attempt {attempt})")
                 return True
@@ -237,10 +237,11 @@ def deploy_to(commands: dict, target: str, cwd: str | None = None) -> tuple[bool
         return False, previous_tag
 
     print(f"\n[deploy] --- HEALTH CHECK ({target.upper()}) ---")
-    # Staging scales to zero — allow more time for cold start
+    # Staging scales to zero — longer timeout and more retries for cold start
     retries = 15 if target == "staging" else 5
     delay = 15.0 if target == "staging" else 10.0
-    healthy = verify_health(health_url, retries=retries, delay=delay)
+    http_timeout = 60 if target == "staging" else 30
+    healthy = verify_health(health_url, retries=retries, delay=delay, timeout=http_timeout)
     if healthy:
         print(f"[deploy] ✅ {target.upper()} healthy")
     else:
