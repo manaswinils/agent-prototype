@@ -23,10 +23,13 @@ load_dotenv()
 REVIEW_MODEL = "claude-opus-4-6"
 
 SYSTEM_PROMPT = """You are a senior software engineer conducting a thorough pull request review.
+You will receive the PR diff AND project context files (CLAUDE.md, ARCHITECTURE.md, TEST.md).
+Use the context to review against established project conventions and architecture.
+
 You respond ONLY with a single JSON object — no markdown, no prose, no code fences.
 The JSON must conform exactly to this schema:
 {
-  "summary": "<2-3 sentence overall assessment>",
+  "summary": "<2-3 sentence overall assessment, noting whether conventions were followed>",
   "inline_comments": [
     {"file": "<relative path>", "line": <integer new-file line>, "comment": "<actionable feedback>"}
   ],
@@ -36,9 +39,11 @@ Rules:
 - Line numbers must be new-file line numbers visible in the diff (lines starting with +).
 - Limit inline_comments to the 10 most important issues.
 - Check for: security vulnerabilities, logic errors, missing error handling, style issues,
-  hardcoded secrets, missing input validation, and framework best practices.
-- Verdict is APPROVE only when the code is correct, secure, and follows best practices.
-- Verdict is REQUEST_CHANGES for any significant security flaw, logic error, or missing error handling.
+  hardcoded secrets, missing input validation, framework best practices, and convention
+  violations against CLAUDE.md and ARCHITECTURE.md.
+- Verdict is APPROVE only when the code is correct, secure, and follows project conventions.
+- Verdict is REQUEST_CHANGES for any significant security flaw, logic error, missing error
+  handling, or clear violation of documented project conventions.
 """
 
 
@@ -63,6 +68,26 @@ def parse_valid_new_lines(patch: str) -> set[int]:
         else:
             new_line += 1  # context line
     return valid
+
+
+def fetch_context_for_review(pr) -> str:
+    """
+    Fetch living context docs from the repo at the PR head SHA.
+    Returns a concatenated string of CLAUDE.md, ARCHITECTURE.md, TEST.md.
+    Falls back gracefully if files are absent.
+    """
+    context_files = ["CLAUDE.md", "ARCHITECTURE.md", "TEST.md"]
+    parts: list[str] = []
+    for fname in context_files:
+        try:
+            contents = pr.base.repo.get_contents(fname, ref=pr.head.sha)
+            text = contents.decoded_content.decode("utf-8", errors="replace")
+            parts.append(f"### {fname}\n{text}")
+        except Exception:
+            pass  # File absent or inaccessible — skip silently
+    if parts:
+        print(f"[review] loaded context files: {[f for f in context_files if f.lower() in ' '.join(parts).lower()]}")
+    return "\n\n".join(parts)
 
 
 def build_diff_content(pr) -> tuple[str, dict[str, set[int]]]:
@@ -226,10 +251,12 @@ def review_pr(token: str, repo_full_name: str, pr_number: int) -> str:
         print("[review] no diff content found; skipping review.")
         return "APPROVE"
 
+    repo_context = fetch_context_for_review(pr)
     user_message = (
         f"PR #{pr_number}: {pr.title}\n\n"
         f"Description:\n{pr.body or '(none)'}\n\n"
-        f"Diff:\n{diff_content}"
+        + (f"Project Context:\n{repo_context}\n\n" if repo_context else "")
+        + f"Diff:\n{diff_content}"
     )
 
     print(f"[review] calling Claude {REVIEW_MODEL} ...")

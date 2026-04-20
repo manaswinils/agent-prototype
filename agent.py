@@ -1,10 +1,13 @@
 """Minimal coding agent: goal in, PR out. Supports iterating on existing PRs via --pr."""
 import argparse
+import json
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
+import urllib.error
+import urllib.request
 import uuid
 from pathlib import Path
 
@@ -352,6 +355,93 @@ def revert_merge_on_main(
             print(f"[revert] merge error: {e}")
 
     return True, revert_pr.html_url
+
+
+def _graphql_request(token: str, query: str, variables: dict) -> dict:
+    """Make a GitHub GraphQL API POST request. Returns the parsed JSON response."""
+    payload = json.dumps({"query": query, "variables": variables}).encode()
+    req = urllib.request.Request(
+        "https://api.github.com/graphql",
+        data=payload,
+        headers={
+            "Authorization": f"bearer {token}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        return json.loads(resp.read())
+
+
+def get_open_review_thread_ids(token: str, repo_full_name: str, pr_number: int) -> list[str]:
+    """Return IDs of unresolved review threads for a PR via GitHub GraphQL."""
+    owner, repo = repo_full_name.split("/", 1)
+    query = """
+    query($owner: String!, $repo: String!, $pr: Int!) {
+      repository(owner: $owner, name: $repo) {
+        pullRequest(number: $pr) {
+          reviewThreads(first: 100) {
+            nodes { id isResolved }
+          }
+        }
+      }
+    }"""
+    try:
+        result = _graphql_request(token, query, {"owner": owner, "repo": repo, "pr": pr_number})
+        threads = (
+            result.get("data", {})
+            .get("repository", {})
+            .get("pullRequest", {})
+            .get("reviewThreads", {})
+            .get("nodes", [])
+        )
+        open_ids = [t["id"] for t in threads if not t.get("isResolved", True)]
+        print(f"[review-threads] PR #{pr_number}: {len(threads)} total, {len(open_ids)} unresolved")
+        return open_ids
+    except Exception as e:
+        print(f"[review-threads] get_open_review_thread_ids failed: {e}")
+        return []
+
+
+def resolve_review_thread(token: str, thread_id: str) -> bool:
+    """Resolve a single review thread via GitHub GraphQL mutation."""
+    mutation = """
+    mutation($threadId: ID!) {
+      resolveReviewThread(input: {threadId: $threadId}) {
+        thread { id isResolved }
+      }
+    }"""
+    try:
+        result = _graphql_request(token, mutation, {"threadId": thread_id})
+        resolved = (
+            result.get("data", {})
+            .get("resolveReviewThread", {})
+            .get("thread", {})
+            .get("isResolved", False)
+        )
+        if resolved:
+            print(f"[review-threads] resolved thread {thread_id[:24]}...")
+        else:
+            errors = result.get("errors", [])
+            print(f"[review-threads] thread {thread_id[:24]}... not resolved: {errors}")
+        return resolved
+    except Exception as e:
+        print(f"[review-threads] resolve_review_thread failed: {e}")
+        return False
+
+
+def resolve_all_review_threads(token: str, repo_full_name: str, pr_number: int) -> int:
+    """
+    Resolve all open review threads for a PR.
+    Returns the count of threads that were successfully resolved.
+    """
+    open_ids = get_open_review_thread_ids(token, repo_full_name, pr_number)
+    if not open_ids:
+        print(f"[review-threads] PR #{pr_number}: no open threads to resolve")
+        return 0
+    resolved = sum(1 for tid in open_ids if resolve_review_thread(token, tid))
+    print(f"[review-threads] PR #{pr_number}: resolved {resolved}/{len(open_ids)} threads")
+    return resolved
 
 
 def request_re_review(token: str, repo_full_name: str, pr_number: int, reviewer_logins: list[str], team_slugs: list[str]) -> None:
