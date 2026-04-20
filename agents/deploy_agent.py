@@ -242,11 +242,19 @@ def deploy_to(commands: dict, target: str, cwd: str | None = None) -> tuple[bool
     delay = 15.0 if target == "staging" else 10.0
     http_timeout = 120 if target == "staging" else 30
     healthy = verify_health(health_url, retries=retries, delay=delay, timeout=http_timeout)
-    if healthy:
-        print(f"[deploy] ✅ {target.upper()} healthy")
-    else:
+    if not healthy:
         print(f"[deploy] ⚠️  {target.upper()} health check failed")
-    return healthy, previous_tag
+        return False, previous_tag
+
+    # Extra warmup: Azure Container Apps can pass the /health probe while the new
+    # revision is still accepting traffic — wait for the revision to fully stabilise
+    # before handing off to E2E tests. This prevents the race condition where the
+    # first E2E request hits the old revision.
+    warmup_secs = 20 if target == "staging" else 10
+    print(f"[deploy] waiting {warmup_secs}s for revision to fully stabilise ...")
+    time.sleep(warmup_secs)
+    print(f"[deploy] ✅ {target.upper()} healthy and stable")
+    return True, previous_tag
 
 
 def rollback_to(commands: dict, target: str, previous_tag: str, cwd: str | None = None) -> bool:
