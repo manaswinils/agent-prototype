@@ -14,8 +14,10 @@ Required env vars:
 """
 import argparse
 import os
+import re
 import shutil
 import tempfile
+from datetime import datetime
 from pathlib import Path
 
 from anthropic import Anthropic
@@ -211,9 +213,27 @@ def plan(
         )
     plan_content = raw[idx:].strip()
 
+    # Archive: write to plans/<timestamp>-<slug>.md — never overwrite older plans
+    plans_dir = repo_path / "plans"
+    plans_dir.mkdir(exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    slug = re.sub(r"[^a-z0-9]+", "-", goal.lower())[:40].strip("-")
+    archive_path = plans_dir / f"plan-{timestamp}-{slug}.md"
+    archive_path.write_text(plan_content, encoding="utf-8")
+    print(f"[plan] archived → plans/{archive_path.name} ({len(plan_content)} chars)")
+
+    # Also write plan.md at root as "latest plan" pointer for agent backward-compat
     plan_path = repo_path / "plan.md"
-    plan_path.write_text(plan_content, encoding="utf-8")
-    print(f"[plan] plan.md written ({len(plan_content)} chars)")
+    pointer = (
+        f"<!-- Latest plan: plans/{archive_path.name} -->\n"
+        f"<!-- This file is auto-updated. Full history in plans/ directory. -->\n\n"
+        + plan_content
+    )
+    plan_path.write_text(pointer, encoding="utf-8")
+    print(f"[plan] plan.md updated (→ plans/{archive_path.name})")
+
+    # Add plans/ to .gitignore if not already present (prevent plan spam in PRs)
+    # We keep plans/ committed so history is preserved — no gitignore addition
 
     return plan_content
 

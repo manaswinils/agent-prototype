@@ -1,26 +1,34 @@
 """Multi-stage agentic pipeline for the motivational quote app.
 
 Stages:
-  1.  PLAN                — plan_agent reads living docs, explores repo, writes plan.md
-  2.  IMPLEMENT           — coding agent reads living docs + plan.md, implements, opens PR
-  3.  TEST                — generate + run pytest tests locally (non-fatal)
-  2.5 HARNESS             — lint (ruff/mypy) + fitness functions; results posted as PR comment
-  3.  TEST                — generate + run pytest tests locally (non-fatal; replaces old stage 3)
-  4.  REVIEW              — review_agent reads CLAUDE.md+ARCHITECTURE.md+TEST.md, reviews PR
-  5.  RESOLVE COMMENTS    — coding agent addresses feedback, resolve_all_review_threads (if needed)
-  6.  TEST AFTER RESOLVE  — re-run tests on updated branch (if needed)
-  7.  BUILD + STAGING     — az acr build → deploy to staging Container App
-  8.  E2E STAGING         — Puppeteer E2E tests vs live staging (real Anthropic API)
-  9.  COMMIT              — squash-merge the PR to main
-  10. UPDATE LIVING DOCS  — docs_agent updates ARCHITECTURE.md, TEST.md, DECISIONS.md, CLAUDE.md
-  11. DEPLOY PROD         — deploy same image tag to prod Container App (no rebuild)
-  12. E2E PROD            — Puppeteer E2E vs prod; fail → rollback + revert main + GitHub issue
+  1.   PLAN                — plan_agent reads living docs, explores repo, writes plan.md
+       [HITL gate]         — human reviews plan before implementation begins
+  2.   IMPLEMENT           — coding agent reads living docs + plan.md, implements, opens PR
+  2.5  HARNESS             — lint (ruff/mypy) + fitness functions; results posted as PR comment
+  3.   TEST                — generate + run pytest tests locally (non-fatal)
+       [HITL gate]         — human reviews test results before review begins
+  4.   REVIEW              — review_agent reads CLAUDE.md+ARCHITECTURE.md+TEST.md, reviews PR
+       [HITL gate]         — human reviews AI verdict + inline comments before advancing
+  5.   RESOLVE COMMENTS    — coding agent addresses feedback, resolve_all_review_threads (if needed)
+  6.   TEST AFTER RESOLVE  — re-run tests on updated branch (if needed)
+  7.   BUILD + STAGING     — az acr build → deploy to staging Container App
+       [HITL gate]         — human approves before E2E tests run against staging
+  8.   E2E STAGING         — Puppeteer E2E tests vs live staging (real Anthropic API)
+       [HITL gate]         — human approves before merge to main
+  9.   COMMIT              — squash-merge the PR to main
+  10.  UPDATE LIVING DOCS  — docs_agent updates ARCHITECTURE.md, TEST.md, DECISIONS.md, CLAUDE.md
+  11.  DEPLOY PROD         — deploy same image tag to prod Container App (no rebuild)
+  12.  E2E PROD            — Puppeteer E2E vs prod; fail → rollback + revert main + GitHub issue
 
 Stages 4-6 repeat up to --max-resolve times. Pipeline enforces that ALL review threads
 must be resolved before advancing to Stage 7 (staging deploy).
 
+All run_command calls from agents execute inside an isolated sandbox (Docker container
+when available, restricted subprocess otherwise).
+
 Usage:
     python pipeline.py "add a /health endpoint" [--repo owner/repo] [--max-resolve 3]
+    python pipeline.py "add dark mode" --auto          # skip all HITL gates (CI mode)
 
 Required env vars:
     ANTHROPIC_API_KEY
@@ -61,11 +69,59 @@ from agents.deploy_agent import build_image, deploy_to, generate_all_commands, r
 from agents.docs_agent import update_living_docs, write_and_commit_docs
 from agents.plan_agent import plan
 from agents.review_agent import review_pr
-from agents.tools import ToolExecutor
+from agents.sandbox import create_sandbox
+from agents.tools import SandboxToolExecutor, ToolExecutor
 
 load_dotenv()
 
 MAX_RESOLVE_ITERATIONS = 3
+
+
+# ── human-in-the-loop gate ────────────────────────────────────────────────────
+
+def human_gate(stage: str, summary: str, auto: bool = False) -> tuple[bool, str]:
+    """Pause the pipeline and wait for human approval.
+
+    Args:
+        stage:   Name of the gate (shown in the prompt).
+        summary: Formatted summary of what the agent just did.
+        auto:    If True, skip the gate and return (True, "") immediately.
+
+    Returns:
+        (approved, feedback) — feedback is any text the human typed before
+        pressing ENTER; it is passed to the next stage's prompt.
+    """
+    if auto:
+        return True, ""
+
+    border = "=" * 60
+    print(f"\n{border}")
+    print(f"👤  HUMAN REVIEW: {stage}")
+    print(border)
+    print(summary)
+    print(f"\n{border}")
+    print("  [ENTER]       → Approve and continue to next stage")
+    print("  [your text]   → Approve with feedback for the next stage")
+    print("  abort         → Abort the pipeline now")
+    print(border)
+
+    try:
+        response = input("▶ ").strip()
+    except EOFError:
+        # Non-interactive (pipe/redirect) — treat as auto-approve
+        print("[hitl] non-interactive mode — auto-approving")
+        return True, ""
+
+    if response.lower() in ("abort", "no", "stop", "cancel"):
+        print(f"[hitl] ❌ Pipeline aborted at '{stage}' by user.")
+        return False, ""
+
+    feedback = response if response else ""
+    if feedback:
+        print(f"[hitl] ✅ Approved with feedback: {feedback[:120]}")
+    else:
+        print(f"[hitl] ✅ Approved")
+    return True, feedback
 
 # Model for locally-generated tests (mirrors .agents/test_agent.py)
 TEST_MODEL = "claude-sonnet-4-6"
@@ -147,6 +203,7 @@ class PipelineState:
     token: str
     repo_full_name: str
     username: str
+    auto: bool = False          # skip all HITL gates when True
     repo_path: Path | None = None
     branch: str | None = None
     pr_number: int | None = None
@@ -422,8 +479,23 @@ def run_pipeline(state: PipelineState, max_resolve: int = MAX_RESOLVE_ITERATIONS
         repo_path=state.repo_path,
     )
 
+    # ── HITL GATE: PLAN ──────────────────────────────────────────────────────
+    plan_summary = (
+        f"Goal: {state.goal}\n\n"
+        f"Plan preview (first 3000 chars):\n"
+        f"{state.plan_content[:3000]}"
+        + (" [truncated]" if len(state.plan_content) > 3000 else "")
+    )
+    approved, plan_feedback = human_gate("PLAN REVIEW", plan_summary, auto=state.auto)
+    if not approved:
+        sys.exit(0)
+
     # ── STAGE 2: IMPLEMENT ───────────────────────────────────────────────────
     stage(2, "IMPLEMENT")
+    feedback_note = (
+        f"\n\nHuman reviewer feedback on the plan:\n{plan_feedback}\n"
+        if plan_feedback else ""
+    )
     goal_with_plan = (
         f"{state.goal}\n\n"
         f"Read these context files FIRST — they contain accumulated project knowledge:\n"
@@ -439,9 +511,13 @@ def run_pipeline(state: PipelineState, max_resolve: int = MAX_RESOLVE_ITERATIONS
         f"  - docs/rules/templates.md  if touching templates/ (selectors, form structure, escaping)\n"
         f"  - docs/rules/harness.md    if touching harness/ (script conventions, fitness checks)\n\n"
         f"Plan summary:\n{state.plan_content[:2000]}"
+        + feedback_note
     )
-    executor = ToolExecutor(state.repo_path)
-    summary = run_agent_loop(client, executor, goal_with_plan)
+
+    # Run coding agent inside sandbox
+    with create_sandbox(state.repo_path) as sandbox:
+        executor = SandboxToolExecutor(state.repo_path, sandbox)
+        summary = run_agent_loop(client, executor, goal_with_plan)
     state.impl_summary = summary
 
     state.branch = f"agent/{uuid.uuid4().hex[:8]}"
@@ -474,6 +550,17 @@ def run_pipeline(state: PipelineState, max_resolve: int = MAX_RESOLVE_ITERATIONS
     state.test_passed = run_test_stage(state.repo_path)
     print(f"[pipeline] Tests: {'PASSED' if state.test_passed else 'FAILED (non-fatal)'}")
 
+    # ── HITL GATE: TEST RESULTS ──────────────────────────────────────────────
+    test_summary = (
+        f"PR: {state.pr_url}\n"
+        f"Tests: {'✅ PASSED' if state.test_passed else '⚠️  FAILED (non-fatal — pipeline will continue)'}\n\n"
+        f"Review the PR diff and test output above.\n"
+        f"Type feedback to pass notes to the review agent, or press ENTER to continue."
+    )
+    approved, _test_feedback = human_gate("TEST RESULTS", test_summary, auto=state.auto)
+    if not approved:
+        sys.exit(0)
+
     # ── STAGES 4-6: REVIEW / RESOLVE loop ───────────────────────────────────
     # The pipeline will NOT advance to deployment until:
     #   (a) the review verdict is APPROVE, AND
@@ -491,6 +578,27 @@ def run_pipeline(state: PipelineState, max_resolve: int = MAX_RESOLVE_ITERATIONS
         verdict = review_pr(state.token, state.repo_full_name, state.pr_number)
         state.review_verdict = verdict
         state.resolve_iterations = iteration
+
+        # ── HITL GATE: REVIEW VERDICT ────────────────────────────────────────
+        review_summary = (
+            f"PR: {state.pr_url}\n"
+            f"AI Verdict: {'✅ APPROVE' if verdict == 'APPROVE' else '🔄 REQUEST_CHANGES'}\n\n"
+            f"Review the inline comments on the PR above.\n"
+            f"Type 'override-approve' to force approval regardless of AI verdict.\n"
+            f"Type 'request-changes' to force another resolve cycle.\n"
+            f"Press ENTER to accept the AI verdict."
+        )
+        gate_ok, review_feedback = human_gate(
+            f"REVIEW VERDICT (iteration {iteration})", review_summary, auto=state.auto
+        )
+        if not gate_ok:
+            sys.exit(0)
+        if review_feedback.lower() == "override-approve":
+            verdict = "APPROVE"
+            print("[hitl] Human overrode verdict → APPROVE")
+        elif review_feedback.lower() == "request-changes":
+            verdict = "REQUEST_CHANGES"
+            print("[hitl] Human overrode verdict → REQUEST_CHANGES")
 
         if verdict == "APPROVE":
             # Verify all threads are resolved before advancing
@@ -520,9 +628,10 @@ def run_pipeline(state: PipelineState, max_resolve: int = MAX_RESOLVE_ITERATIONS
             state.repo_full_name, state.token, state.username, branch=state.branch
         )
         try:
-            resolve_executor = ToolExecutor(resolve_path)
-            prompt = format_pr_context_for_prompt(pr_ctx, state.goal)
-            resolve_summary = run_agent_loop(client, resolve_executor, prompt)
+            with create_sandbox(resolve_path) as sandbox:
+                resolve_executor = SandboxToolExecutor(resolve_path, sandbox)
+                prompt = format_pr_context_for_prompt(pr_ctx, state.goal)
+                resolve_summary = run_agent_loop(client, resolve_executor, prompt)
             commit_msg = (
                 f"Agent: address PR #{state.pr_number} feedback "
                 f"(iteration {iteration})\n\n{resolve_summary}"
@@ -581,6 +690,19 @@ def run_pipeline(state: PipelineState, max_resolve: int = MAX_RESOLVE_ITERATIONS
         _print_summary(state)
         sys.exit(1)
 
+    # ── HITL GATE: STAGING DEPLOY ────────────────────────────────────────────
+    staging_url = state.deploy_commands["staging_health_url"]
+    staging_deploy_summary = (
+        f"✅ Image deployed to staging\n"
+        f"Tag:  {state.deploy_tag}\n"
+        f"URL:  {staging_url}\n\n"
+        f"Manually verify the staging app before E2E tests start.\n"
+        f"Open {staging_url} in your browser, then press ENTER to run E2E."
+    )
+    gate_ok, _ = human_gate("STAGING DEPLOY", staging_deploy_summary, auto=state.auto)
+    if not gate_ok:
+        sys.exit(0)
+
     # ── STAGE 8: E2E TEST (STAGING) ──────────────────────────────────────────
     stage(8, "E2E TEST — STAGING")
     staging_e2e_path = clone_repo(
@@ -608,6 +730,18 @@ def run_pipeline(state: PipelineState, max_resolve: int = MAX_RESOLVE_ITERATIONS
         sys.exit(1)
 
     print("[pipeline] Staging E2E passed ✅")
+
+    # ── HITL GATE: STAGING E2E ───────────────────────────────────────────────
+    e2e_staging_summary = (
+        f"✅ All staging E2E tests passed\n"
+        f"Staging URL: {state.deploy_commands['staging_health_url']}\n"
+        f"PR: {state.pr_url}\n\n"
+        f"This will now MERGE the PR to main and deploy to PRODUCTION.\n"
+        f"Type 'abort' to stop here and keep the PR open, or press ENTER to merge."
+    )
+    gate_ok, _ = human_gate("STAGING E2E — APPROVE MERGE TO PROD", e2e_staging_summary, auto=state.auto)
+    if not gate_ok:
+        sys.exit(0)
 
     # ── STAGE 9: COMMIT (only after staging E2E passes) ──────────────────────
     stage(9, "COMMIT")
@@ -714,6 +848,7 @@ def _print_summary(state: PipelineState) -> None:
     print(f"\n{'=' * 60}")
     print("=== PIPELINE COMPLETE ===")
     print(f"{'=' * 60}")
+    print(f"Mode:          {'🤖 auto (no HITL gates)' if state.auto else '👤 interactive (HITL gates enabled)'}")
     print(f"Goal:          {state.goal}")
     print(f"PR:            {state.pr_url or 'N/A'}")
     print(f"Unit Tests:    {'✅ PASSED' if state.test_passed else '⚠️  FAILED'}")
@@ -743,6 +878,8 @@ def main() -> None:
     parser.add_argument("--max-resolve", type=int, default=MAX_RESOLVE_ITERATIONS,
                         dest="max_resolve",
                         help=f"Max review/resolve iterations before aborting (default: {MAX_RESOLVE_ITERATIONS})")
+    parser.add_argument("--auto", action="store_true",
+                        help="Skip all human-in-the-loop gates (CI/CD mode)")
     args = parser.parse_args()
 
     # Validate all env vars up front
@@ -751,11 +888,16 @@ def main() -> None:
     username = os.environ["GITHUB_USERNAME"]
     repo = args.repo or os.environ["GITHUB_REPO"]
 
+    if not args.auto:
+        print("\n🔍 Interactive mode — HITL gates enabled at key stages.")
+        print("   Run with --auto to skip all gates (CI/CD mode).\n")
+
     state = PipelineState(
         goal=args.goal,
         token=token,
         repo_full_name=repo,
         username=username,
+        auto=args.auto,
     )
 
     try:

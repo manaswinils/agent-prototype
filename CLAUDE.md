@@ -11,7 +11,9 @@ A collection of autonomous AI agents that operate on GitHub repositories:
 - **`deploy_agent.py`** — deploy agent: reads `deploy.md`, calls Claude for az CLI commands, builds image once, deploys to staging then prod, health checks, rollback support.
 - **`docs_agent.py`** — living docs updater: after every successful merge, updates ARCHITECTURE.md, TEST.md, DECISIONS.md, CLAUDE.md in the target repo based on what changed.
 - **`pipeline.py`** — orchestrator: runs all 13 stages end-to-end (see pipeline stages below).
-- **`tools.py`** — tool executor used by coding and plan agents (list_files, read_file, write_file, run_command).
+- **`tools.py`** — tool executor: `ToolExecutor` (direct) and `SandboxToolExecutor` (sandbox-isolated run_command).
+- **`sandbox.py`** — execution sandbox: `DockerSandbox` (Docker container, preferred) and `ProcessSandbox` (restricted subprocess fallback). All agent run_command calls go through here.
+- **`gc_agent.py`** — periodic garbage collection agent: dead code, complexity, docs drift, creates GitHub issue.
 
 ## Environment setup
 
@@ -32,28 +34,45 @@ Required `.env` variables:
 
 ```
 Stage 1   PLAN              plan_agent.py reads living docs → writes plan.md
-Stage 2   IMPLEMENT         agent.py reads living docs → implements → opens PR
+          [HITL gate]       human reviews plan, can provide feedback to implementation
+Stage 2   IMPLEMENT         agent.py reads living docs → implements → opens PR (sandbox)
+Stage 2.5 HARNESS           lint.sh + fitness.py → posted as PR comment (non-blocking)
 Stage 3   TEST              generate pytest tests (Claude) → run locally
+          [HITL gate]       human reviews test results
 Stage 4   REVIEW            review_agent.py reads CLAUDE.md+ARCHITECTURE.md+TEST.md → reviews PR
-Stage 5   RESOLVE COMMENTS  agent.py addresses feedback → resolve_all_review_threads (GraphQL)
+          [HITL gate]       human reviews verdict, can override AI decision
+Stage 5   RESOLVE COMMENTS  agent.py addresses feedback → resolve_all_review_threads (sandbox)
 Stage 6   TEST AFTER RESOLVE re-run tests on updated branch
 Stage 7   BUILD+STAGING     deploy_agent.py: az acr build → deploy to staging Container App
-Stage 8   E2E STAGING        Puppeteer E2E vs live staging (real Anthropic API)
+          [HITL gate]       human manually verifies staging URL before E2E
+Stage 8   E2E STAGING       Puppeteer E2E vs live staging (real Anthropic API)
+          [HITL gate]       human approves before irreversible merge to main
 Stage 9   COMMIT            squash-merge PR to main
 Stage 10  UPDATE DOCS       docs_agent.py updates ARCHITECTURE/TEST/DECISIONS/CLAUDE.md → commit
 Stage 11  DEPLOY PROD       deploy_agent.py: deploy same image tag to prod Container App
 Stage 12  E2E PROD          Puppeteer E2E vs prod; on failure: rollback + revert main + GitHub issue
 ```
 
-Stages 4-6 loop up to `--max-resolve` times (default 3). Pipeline enforces: all review threads
-must be resolved before advancing to Stage 7.
+Stages 4-6 loop up to `--max-resolve` times (default 3). All agent run_command calls execute
+inside an isolated sandbox (DockerSandbox when Docker is available, ProcessSandbox otherwise).
+
+## Sandbox
+
+Agent shell execution is isolated via `agents/sandbox.py`:
+- **DockerSandbox** (preferred): container with `--network none`, `--memory 512m`, `--cpus 1.0`
+- **ProcessSandbox** (fallback): subprocess with CPU resource limits, no Docker required
+- File ops (read_file, write_file, list_files) always run on the host — the repo clone is
+  the shared state between the agent and the sandbox.
 
 ## Running the agents
 
 ```bash
-# Run the full pipeline end-to-end (recommended)
+# Run the full pipeline end-to-end (interactive, HITL gates at key stages)
 python pipeline.py "add a /health endpoint"
 python pipeline.py "add dark mode" --max-resolve 5
+
+# Run without HITL gates (CI/CD mode)
+python pipeline.py "add a /health endpoint" --auto
 
 # Run individual agents
 python agent.py "add a hello world endpoint"        # open new PR

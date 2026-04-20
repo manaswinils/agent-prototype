@@ -2,6 +2,10 @@
 import os
 import subprocess
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from agents.sandbox import DockerSandbox, ProcessSandbox
 
 # JSON schemas Claude sees — these tell the model what tools exist and how to call them.
 TOOL_SCHEMAS = [
@@ -163,3 +167,34 @@ class ToolExecutor:
             return f"Error: unknown tool '{tool_name}'"
         except Exception as e:
             return f"Error executing {tool_name}: {e}"
+
+
+class SandboxToolExecutor(ToolExecutor):
+    """ToolExecutor that routes run_command through an isolated sandbox.
+
+    File operations (list_files, read_file, write_file) still operate directly
+    on the host filesystem — the repo clone is the shared state between the
+    agent and the sandbox. Only shell execution is sandboxed.
+
+    Args:
+        repo_dir: The local repo clone (shared between host and sandbox).
+        sandbox:  A started DockerSandbox or ProcessSandbox instance.
+    """
+
+    def __init__(self, repo_dir: Path, sandbox: "DockerSandbox | ProcessSandbox"):
+        super().__init__(repo_dir)
+        self.sandbox = sandbox
+
+    def run_command(self, command: str) -> str:
+        """Execute the command inside the sandbox."""
+        forbidden = ("git ", "git\t")
+        if command.strip().startswith(forbidden) or command.strip() == "git":
+            return "Error: git commands are handled automatically. Do not run git yourself."
+        try:
+            exit_code, output = self.sandbox.exec(command, timeout=60)
+            result = f"exit_code: {exit_code}\n"
+            if output:
+                result += f"stdout:\n{output[:5000]}\n"
+            return result
+        except Exception as e:
+            return f"Error executing command in sandbox: {e}"
