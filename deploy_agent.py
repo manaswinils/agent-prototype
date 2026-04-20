@@ -235,7 +235,10 @@ def deploy_to(commands: dict, target: str, cwd: str | None = None) -> tuple[bool
         return False, previous_tag
 
     print(f"\n[deploy] --- HEALTH CHECK ({target.upper()}) ---")
-    healthy = verify_health(health_url)
+    # Staging scales to zero — allow more time for cold start
+    retries = 15 if target == "staging" else 5
+    delay = 15.0 if target == "staging" else 10.0
+    healthy = verify_health(health_url, retries=retries, delay=delay)
     if healthy:
         print(f"[deploy] ✅ {target.upper()} healthy")
     else:
