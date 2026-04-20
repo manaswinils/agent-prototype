@@ -240,7 +240,7 @@ def deploy_to(commands: dict, target: str, cwd: str | None = None) -> tuple[bool
     # Staging scales to zero — longer timeout and more retries for cold start
     retries = 15 if target == "staging" else 5
     delay = 15.0 if target == "staging" else 10.0
-    http_timeout = 60 if target == "staging" else 30
+    http_timeout = 120 if target == "staging" else 30
     healthy = verify_health(health_url, retries=retries, delay=delay, timeout=http_timeout)
     if healthy:
         print(f"[deploy] ✅ {target.upper()} healthy")
