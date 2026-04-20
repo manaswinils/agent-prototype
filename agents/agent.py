@@ -382,32 +382,178 @@ def _graphql_request(token: str, query: str, variables: dict) -> dict:
 
 def get_open_review_thread_ids(token: str, repo_full_name: str, pr_number: int) -> list[str]:
     """Return IDs of unresolved review threads for a PR via GitHub GraphQL."""
+    threads = get_review_thread_details(token, repo_full_name, pr_number)
+    open_ids = [t["id"] for t in threads if not t.get("isResolved", True)]
+    print(f"[review-threads] PR #{pr_number}: {len(threads)} total, {len(open_ids)} unresolved")
+    return open_ids
+
+
+def get_review_thread_details(token: str, repo_full_name: str, pr_number: int) -> list[dict]:
+    """Return full details of all review threads (resolved and open) for a PR.
+
+    Each dict contains:
+      id           — GraphQL thread ID (for resolve mutation)
+      isResolved   — bool
+      first_comment_db_id — REST API comment ID (for posting replies)
+      body         — text of the first (original) comment
+      path         — file path
+      line         — line number
+      author       — reviewer login
+    """
     owner, repo = repo_full_name.split("/", 1)
     query = """
     query($owner: String!, $repo: String!, $pr: Int!) {
       repository(owner: $owner, name: $repo) {
         pullRequest(number: $pr) {
           reviewThreads(first: 100) {
-            nodes { id isResolved }
+            nodes {
+              id
+              isResolved
+              comments(first: 1) {
+                nodes {
+                  databaseId
+                  body
+                  path
+                  line
+                  author { login }
+                }
+              }
+            }
           }
         }
       }
     }"""
     try:
         result = _graphql_request(token, query, {"owner": owner, "repo": repo, "pr": pr_number})
-        threads = (
+        nodes = (
             result.get("data", {})
             .get("repository", {})
             .get("pullRequest", {})
             .get("reviewThreads", {})
             .get("nodes", [])
         )
-        open_ids = [t["id"] for t in threads if not t.get("isResolved", True)]
-        print(f"[review-threads] PR #{pr_number}: {len(threads)} total, {len(open_ids)} unresolved")
-        return open_ids
+        threads = []
+        for node in nodes:
+            first = (node.get("comments", {}).get("nodes") or [{}])[0]
+            threads.append({
+                "id": node["id"],
+                "isResolved": node.get("isResolved", False),
+                "first_comment_db_id": first.get("databaseId"),
+                "body": first.get("body", ""),
+                "path": first.get("path", ""),
+                "line": first.get("line"),
+                "author": (first.get("author") or {}).get("login", "reviewer"),
+            })
+        return threads
     except Exception as e:
-        print(f"[review-threads] get_open_review_thread_ids failed: {e}")
+        print(f"[review-threads] get_review_thread_details failed: {e}")
         return []
+
+
+def reply_to_review_comment(
+    token: str,
+    repo_full_name: str,
+    pr_number: int,
+    comment_db_id: int,
+    body: str,
+) -> bool:
+    """Post a reply to an existing pull request review comment (REST API)."""
+    owner, repo = repo_full_name.split("/", 1)
+    url = f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}/comments/{comment_db_id}/replies"
+    payload = json.dumps({"body": body}).encode()
+    req = urllib.request.Request(
+        url,
+        data=payload,
+        headers={
+            "Authorization": f"token {token}",
+            "Accept": "application/vnd.github+json",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return resp.status == 201
+    except Exception as e:
+        print(f"[review-threads] reply_to_review_comment failed: {e}")
+        return False
+
+
+def post_resolution_replies(
+    token: str,
+    repo_full_name: str,
+    pr_number: int,
+    pr_ctx: dict,
+    agent_summary: str,
+) -> int:
+    """Post a per-thread reply explaining what the agent changed to address each comment.
+
+    Uses a Claude call to map the agent's changes to specific review comments,
+    then posts a reply to each unresolved thread via the GitHub REST API.
+
+    Returns the number of replies successfully posted.
+    """
+    from anthropic import Anthropic
+    threads = get_review_thread_details(token, repo_full_name, pr_number)
+    open_threads = [t for t in threads if not t["isResolved"]]
+    if not open_threads:
+        print("[review-threads] no open threads to reply to")
+        return 0
+
+    # Build prompt for Claude to generate per-thread replies
+    thread_list = "\n".join(
+        f"[{i+1}] {t['path']}:{t['line']} (@{t['author']}): {t['body'][:300]}"
+        for i, t in enumerate(open_threads)
+    )
+
+    prompt = (
+        f"The coding agent just made changes to address pull request feedback.\n\n"
+        f"Agent's summary of changes:\n{agent_summary}\n\n"
+        f"Open review threads that need replies:\n{thread_list}\n\n"
+        f"For each thread, write a concise reply (1-3 sentences) explaining exactly what "
+        f"was changed to address that specific comment. Be specific about file names and "
+        f"what was done. If a comment was not addressed, say so clearly.\n\n"
+        f"Respond with ONLY a JSON object mapping thread number to reply text:\n"
+        f'{{\"1\": \"reply for thread 1\", \"2\": \"reply for thread 2\", ...}}'
+    )
+
+    client = Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+    try:
+        response = client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=2048,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        raw = response.content[0].text.strip()
+        # Parse JSON
+        import re as _re
+        try:
+            replies = json.loads(raw)
+        except json.JSONDecodeError:
+            m = _re.search(r"\{.*\}", raw, _re.DOTALL)
+            replies = json.loads(m.group(0)) if m else {}
+    except Exception as e:
+        print(f"[review-threads] resolution reply generation failed: {e}")
+        return 0
+
+    posted = 0
+    for i, thread in enumerate(open_threads, 1):
+        reply_text = replies.get(str(i), "")
+        if not reply_text:
+            continue
+        comment_id = thread.get("first_comment_db_id")
+        if not comment_id:
+            continue
+        full_reply = f"🤖 **Agent response:** {reply_text}"
+        success = reply_to_review_comment(token, repo_full_name, pr_number, comment_id, full_reply)
+        if success:
+            posted += 1
+            print(f"[review-threads] replied to thread {i}: {thread['path']}:{thread['line']}")
+        else:
+            print(f"[review-threads] failed to reply to thread {i}")
+
+    print(f"[review-threads] posted {posted}/{len(open_threads)} resolution replies")
+    return posted
 
 
 def resolve_review_thread(token: str, thread_id: str) -> bool:

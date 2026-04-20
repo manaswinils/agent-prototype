@@ -59,8 +59,10 @@ from agents.agent import (
     fetch_pr_context,
     format_pr_context_for_prompt,
     get_open_review_thread_ids,
+    get_review_thread_details,
     merge_pr,
     open_pull_request,
+    post_resolution_replies,
     resolve_all_review_threads,
     revert_merge_on_main,
     run_agent_loop,
@@ -580,13 +582,38 @@ def run_pipeline(state: PipelineState, max_resolve: int = MAX_RESOLVE_ITERATIONS
         state.resolve_iterations = iteration
 
         # ── HITL GATE: REVIEW VERDICT ────────────────────────────────────────
+        # Fetch open thread details BEFORE showing the gate so the human can see
+        # exactly what is unresolved.
+        thread_details = get_review_thread_details(
+            state.token, state.repo_full_name, state.pr_number
+        )
+        open_thread_details = [t for t in thread_details if not t.get("isResolved", True)]
+
+        if open_thread_details:
+            thread_lines = [f"\n⚠️  {len(open_thread_details)} UNRESOLVED THREAD(S):\n"]
+            for i, t in enumerate(open_thread_details, 1):
+                loc = f"{t['path']}:{t['line']}" if t.get("path") else "general"
+                preview = (t.get("body") or "")[:200].replace("\n", " ")
+                thread_lines.append(f"  [{i}] {loc}  (@{t.get('author', 'reviewer')})")
+                thread_lines.append(f"      {preview}")
+            thread_info = "\n".join(thread_lines)
+            thread_note = (
+                f"\n\nNOTE: {len(open_thread_details)} open thread(s) must be resolved "
+                f"before this PR can advance to staging."
+            )
+        else:
+            thread_info = "\n✅ No open review threads."
+            thread_note = ""
+
         review_summary = (
             f"PR: {state.pr_url}\n"
-            f"AI Verdict: {'✅ APPROVE' if verdict == 'APPROVE' else '🔄 REQUEST_CHANGES'}\n\n"
+            f"AI Verdict: {'✅ APPROVE' if verdict == 'APPROVE' else '🔄 REQUEST_CHANGES'}\n"
+            f"{thread_info}\n\n"
             f"Review the inline comments on the PR above.\n"
             f"Type 'override-approve' to force approval regardless of AI verdict.\n"
             f"Type 'request-changes' to force another resolve cycle.\n"
             f"Press ENTER to accept the AI verdict."
+            f"{thread_note}"
         )
         gate_ok, review_feedback = human_gate(
             f"REVIEW VERDICT (iteration {iteration})", review_summary, auto=state.auto
@@ -601,20 +628,62 @@ def run_pipeline(state: PipelineState, max_resolve: int = MAX_RESOLVE_ITERATIONS
             print("[hitl] Human overrode verdict → REQUEST_CHANGES")
 
         if verdict == "APPROVE":
-            # Verify all threads are resolved before advancing
-            open_threads = get_open_review_thread_ids(
-                state.token, state.repo_full_name, state.pr_number
-            )
-            if open_threads:
-                print(
-                    f"[pipeline] Approved but {len(open_threads)} thread(s) still open — "
-                    f"resolving programmatically ..."
-                )
-                resolve_all_review_threads(
-                    state.token, state.repo_full_name, state.pr_number
-                )
-            print(f"[pipeline] ✅ PR #{state.pr_number} approved — all threads resolved.")
-            break
+            if open_thread_details:
+                if state.auto:
+                    # Auto / CI mode: resolve threads programmatically and continue
+                    print(
+                        f"[pipeline] [auto] {len(open_thread_details)} open thread(s) — "
+                        f"resolving programmatically ..."
+                    )
+                    resolve_all_review_threads(state.token, state.repo_full_name, state.pr_number)
+                    print(f"[pipeline] ✅ PR #{state.pr_number} approved — all threads resolved.")
+                    break
+                else:
+                    # Interactive mode: hard-block — human must explicitly confirm each thread
+                    # is addressed before the pipeline resolves them and advances.
+                    confirm_lines = [
+                        f"The following {len(open_thread_details)} review thread(s) are still "
+                        f"OPEN in GitHub:\n"
+                    ]
+                    for i, t in enumerate(open_thread_details, 1):
+                        loc = f"{t['path']}:{t['line']}" if t.get("path") else "general"
+                        preview = (t.get("body") or "")[:200].replace("\n", " ")
+                        confirm_lines.append(f"  [{i}] {loc}  (@{t.get('author', 'reviewer')})")
+                        confirm_lines.append(f"      {preview}")
+                    confirm_lines.append(
+                        "\nType 'resolved' to confirm all threads have been addressed "
+                        "(the pipeline will then close them and advance to staging).\n"
+                        "Press ENTER or any other text to send the PR back to the agent "
+                        "for another resolve cycle."
+                    )
+                    thread_gate_ok, thread_feedback = human_gate(
+                        "CONFIRM THREAD RESOLUTION",
+                        "\n".join(confirm_lines),
+                        auto=False,  # Always interactive — human must explicitly type 'resolved'
+                    )
+                    if not thread_gate_ok:
+                        sys.exit(0)
+                    if thread_feedback.lower() == "resolved":
+                        print(
+                            f"[pipeline] Human confirmed — resolving "
+                            f"{len(open_thread_details)} thread(s) ..."
+                        )
+                        resolve_all_review_threads(
+                            state.token, state.repo_full_name, state.pr_number
+                        )
+                        print(f"[pipeline] ✅ PR #{state.pr_number} approved — all threads resolved.")
+                        break
+                    else:
+                        print(
+                            "[pipeline] Human did not confirm thread resolution — "
+                            "sending PR back to agent for another resolve cycle."
+                        )
+                        verdict = "REQUEST_CHANGES"
+                        # Fall through to REQUEST_CHANGES path below
+            else:
+                # No open threads — safe to advance
+                print(f"[pipeline] ✅ PR #{state.pr_number} approved — no open threads.")
+                break
 
         # REQUEST_CHANGES path — check iteration limit first
         if iteration > max_resolve:
@@ -627,6 +696,7 @@ def run_pipeline(state: PipelineState, max_resolve: int = MAX_RESOLVE_ITERATIONS
         resolve_path = clone_repo(
             state.repo_full_name, state.token, state.username, branch=state.branch
         )
+        resolve_summary = ""
         try:
             with create_sandbox(resolve_path) as sandbox:
                 resolve_executor = SandboxToolExecutor(resolve_path, sandbox)
@@ -646,11 +716,12 @@ def run_pipeline(state: PipelineState, max_resolve: int = MAX_RESOLVE_ITERATIONS
         finally:
             shutil.rmtree(resolve_path, ignore_errors=True)
 
-        # Mark all addressed threads as resolved so re-review starts clean
-        resolved_count = resolve_all_review_threads(
-            state.token, state.repo_full_name, state.pr_number
+        # Post a per-thread reply for each comment explaining what the agent did
+        print("[pipeline] posting per-thread resolution replies ...")
+        post_resolution_replies(
+            state.token, state.repo_full_name, state.pr_number,
+            pr_ctx, resolve_summary,
         )
-        print(f"[pipeline] resolved {resolved_count} review thread(s)")
 
         stage(6, f"TEST AFTER RESOLVE (iteration {iteration})")
         test_path = clone_repo(
