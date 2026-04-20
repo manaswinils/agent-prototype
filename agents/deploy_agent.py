@@ -72,15 +72,15 @@ def _parse_json(text: str) -> dict:
 # ── core helpers ──────────────────────────────────────────────────────────────
 
 def read_deploy_md(repo_path: Path) -> str:
-    """Read deploy.md from the repo root. Raises FileNotFoundError if missing."""
-    path = repo_path / "deploy.md"
+    """Read docs/deploy.md from the repo. Raises FileNotFoundError if missing."""
+    path = repo_path / "docs" / "deploy.md"
     if not path.exists():
         raise FileNotFoundError(
-            f"deploy.md not found at {path}. "
-            "Create deploy.md in the repo root before running the deploy agent."
+            f"docs/deploy.md not found at {path}. "
+            "Create docs/deploy.md in the repo before running the deploy agent."
         )
     content = path.read_text(encoding="utf-8")
-    print(f"[deploy] read deploy.md ({len(content)} chars)")
+    print(f"[deploy] read docs/deploy.md ({len(content)} chars)")
     return content
 
 

@@ -16,7 +16,11 @@ from dotenv import load_dotenv
 from git import Repo
 from github import Github
 
-from tools import TOOL_SCHEMAS, ToolExecutor
+# Standalone-execution support: add repo root to path when run as `python agents/agent.py`
+if __name__ == "__main__":
+    sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from agents.tools import TOOL_SCHEMAS, ToolExecutor
 
 load_dotenv()
 

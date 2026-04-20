@@ -23,7 +23,7 @@ load_dotenv()
 REVIEW_MODEL = "claude-opus-4-6"
 
 SYSTEM_PROMPT = """You are a senior software engineer conducting a thorough pull request review.
-You will receive the PR diff AND project context files (CLAUDE.md, ARCHITECTURE.md, TEST.md).
+You will receive the PR diff AND project context files (CLAUDE.md, docs/ARCHITECTURE.md, docs/TEST.md).
 Use the context to review against established project conventions and architecture.
 
 You respond ONLY with a single JSON object — no markdown, no prose, no code fences.
@@ -40,7 +40,7 @@ Rules:
 - Limit inline_comments to the 10 most important issues.
 - Check for: security vulnerabilities, logic errors, missing error handling, style issues,
   hardcoded secrets, missing input validation, framework best practices, and convention
-  violations against CLAUDE.md and ARCHITECTURE.md.
+  violations against CLAUDE.md and docs/ARCHITECTURE.md.
 - Verdict is APPROVE only when the code is correct, secure, and follows project conventions.
 - Verdict is REQUEST_CHANGES for any significant security flaw, logic error, missing error
   handling, or clear violation of documented project conventions.
@@ -73,10 +73,10 @@ def parse_valid_new_lines(patch: str) -> set[int]:
 def fetch_context_for_review(pr) -> str:
     """
     Fetch living context docs from the repo at the PR head SHA.
-    Returns a concatenated string of CLAUDE.md, ARCHITECTURE.md, TEST.md.
+    Returns a concatenated string of CLAUDE.md, docs/ARCHITECTURE.md, docs/TEST.md.
     Falls back gracefully if files are absent.
     """
-    context_files = ["CLAUDE.md", "ARCHITECTURE.md", "TEST.md"]
+    context_files = ["CLAUDE.md", "docs/ARCHITECTURE.md", "docs/TEST.md"]
     parts: list[str] = []
     for fname in context_files:
         try:

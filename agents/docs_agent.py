@@ -30,8 +30,9 @@ load_dotenv()
 
 DOCS_MODEL = "claude-sonnet-4-6"
 
-# Living docs to maintain — order matters (ARCHITECTURE drives others)
-LIVING_DOCS = ["ARCHITECTURE.md", "TEST.md", "DECISIONS.md", "CLAUDE.md"]
+# Living docs to maintain — paths relative to repo root.
+# ARCHITECTURE/TEST/DECISIONS live in docs/; CLAUDE.md stays at root (Claude Code needs it there).
+LIVING_DOCS = ["docs/ARCHITECTURE.md", "docs/TEST.md", "docs/DECISIONS.md", "CLAUDE.md"]
 
 # Source files to read for doc context — patterns relative to repo root
 SOURCE_PATTERNS = ["*.py", "requirements.txt", "Dockerfile", "Procfile"]
@@ -51,9 +52,9 @@ the CURRENT state of the project after this change.
 
 Rules:
 - Keep existing content that is still accurate; update only what changed
-- ARCHITECTURE.md: update routes table, components, data flow, and deployment topology if changed
-- TEST.md: update the "What is tested" list, coverage notes, and E2E test descriptions if changed
-- DECISIONS.md: prepend a new ADR entry (ADR-NNN) for any significant design decision made in
+- docs/ARCHITECTURE.md: update routes table, components, data flow, and deployment topology if changed
+- docs/TEST.md: update the "What is tested" list, coverage notes, and E2E test descriptions if changed
+- docs/DECISIONS.md: prepend a new ADR entry (ADR-NNN) for any significant design decision made in
   this change; keep all existing entries unchanged; number sequentially from existing highest
 - CLAUDE.md: update the App structure table and CI/CD section if new files or routes were added;
   do NOT change the conventions or "What NOT to do" sections
@@ -61,7 +62,8 @@ Rules:
 - If nothing changed for a particular doc, return the exact existing content unchanged
 
 Respond with ONLY a valid JSON object mapping each filename to its complete updated content.
-{"ARCHITECTURE.md": "# Architecture...", "TEST.md": "...", "DECISIONS.md": "...", "CLAUDE.md": "..."}
+Use the exact keys: "docs/ARCHITECTURE.md", "docs/TEST.md", "docs/DECISIONS.md", "CLAUDE.md"
+{"docs/ARCHITECTURE.md": "# Architecture...", "docs/TEST.md": "...", "docs/DECISIONS.md": "...", "CLAUDE.md": "..."}
 No prose outside the JSON. No markdown fences wrapping the JSON."""
 
 
@@ -201,6 +203,7 @@ def write_and_commit_docs(
     written: list[str] = []
     for fname, content in updates.items():
         fpath = repo_path / fname
+        fpath.parent.mkdir(parents=True, exist_ok=True)  # ensure docs/ exists
         fpath.write_text(content, encoding="utf-8")
         print(f"[docs] wrote {fname} ({len(content)} chars)")
         written.append(fname)

@@ -21,7 +21,13 @@ from pathlib import Path
 from anthropic import Anthropic
 from dotenv import load_dotenv
 
-from tools import ToolExecutor
+# Standalone-execution support: add repo root to path when run as `python agents/plan_agent.py`
+if __name__ == "__main__":
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from agents.tools import ToolExecutor
 
 load_dotenv()
 
@@ -59,17 +65,17 @@ PLAN_SYSTEM_PROMPT = """You are a senior software architect performing codebase 
 Your job: thoroughly explore the repository, then produce a structured implementation plan.
 
 START by reading these living context documents — they capture accumulated project knowledge:
-  - CLAUDE.md        project conventions, coding patterns, app structure, what NOT to do
-  - ARCHITECTURE.md  current system components, routes, data flow, deployment topology
-  - TEST.md          test strategy, what is already tested, mocking patterns, coverage status
-  - DECISIONS.md     past architectural decisions and their rationale (learn from these)
-  - deploy.md        deployment configuration and infrastructure constraints
+  - CLAUDE.md            project conventions, coding patterns, app structure, what NOT to do
+  - docs/ARCHITECTURE.md current system components, routes, data flow, deployment topology
+  - docs/TEST.md         test strategy, what is already tested, mocking patterns, coverage status
+  - docs/DECISIONS.md    past architectural decisions and their rationale (learn from these)
+  - docs/deploy.md       deployment configuration and infrastructure constraints
 
 After reading context files, use list_files and read_file to explore source files
 affected by the goal. When you have sufficient understanding, produce the plan.
 
 Your plan must align with the existing conventions in CLAUDE.md and must not contradict
-any active architectural decisions from DECISIONS.md. If your plan introduces a significant
+any active architectural decisions from docs/DECISIONS.md. If your plan introduces a significant
 new design decision, note it in the Risks and Assumptions section.
 
 Output ONLY the plan.md content — nothing before or after it. It must start exactly with:
@@ -94,7 +100,7 @@ Structure:
 
 ## Implementation Approach
 1. Numbered step-by-step implementation strategy.
-2. Reference specific existing patterns from ARCHITECTURE.md and CLAUDE.md.
+2. Reference specific existing patterns from docs/ARCHITECTURE.md and CLAUDE.md.
 3. Be specific about function names, template variables, and conventions to match.
 
 ## Test Strategy
@@ -104,7 +110,7 @@ Structure:
 
 ## Risks and Assumptions
 - Any new architectural decisions and their rationale
-- Compatibility considerations with existing decisions from DECISIONS.md
+- Compatibility considerations with existing decisions from docs/DECISIONS.md
 """
 
 
@@ -212,7 +218,7 @@ def main() -> None:
     parser.add_argument("--repo", default=None, help="owner/repo (default: GITHUB_REPO env var)")
     args = parser.parse_args()
 
-    from agent import clone_repo
+    from agents.agent import clone_repo
 
     token = os.environ["GITHUB_TOKEN"]
     username = os.environ["GITHUB_USERNAME"]

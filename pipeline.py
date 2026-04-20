@@ -40,7 +40,7 @@ from pathlib import Path
 from anthropic import Anthropic
 from dotenv import load_dotenv
 
-from agent import (
+from agents.agent import (
     clone_repo,
     comment_on_pr,
     commit_and_push_existing_branch,
@@ -55,11 +55,11 @@ from agent import (
     revert_merge_on_main,
     run_agent_loop,
 )
-from deploy_agent import build_image, deploy_to, generate_all_commands, read_deploy_md, rollback_to
-from docs_agent import update_living_docs, write_and_commit_docs
-from plan_agent import plan
-from review_agent import review_pr
-from tools import ToolExecutor
+from agents.deploy_agent import build_image, deploy_to, generate_all_commands, read_deploy_md, rollback_to
+from agents.docs_agent import update_living_docs, write_and_commit_docs
+from agents.plan_agent import plan
+from agents.review_agent import review_pr
+from agents.tools import ToolExecutor
 
 load_dotenv()
 
@@ -346,12 +346,12 @@ def run_pipeline(state: PipelineState, max_resolve: int = MAX_RESOLVE_ITERATIONS
     goal_with_plan = (
         f"{state.goal}\n\n"
         f"Read these context files FIRST — they contain accumulated project knowledge:\n"
-        f"  - CLAUDE.md        conventions, coding patterns, app structure, what NOT to do\n"
-        f"  - ARCHITECTURE.md  current components, routes, data flow, deployment topology\n"
-        f"  - TEST.md          test strategy, mocking patterns, what is already covered\n"
-        f"  - DECISIONS.md     past architectural decisions — respect and follow these\n"
-        f"  - deploy.md        deployment configuration\n"
-        f"  - plan.md          the implementation plan for this goal\n\n"
+        f"  - CLAUDE.md                conventions, coding patterns, app structure, what NOT to do\n"
+        f"  - docs/ARCHITECTURE.md     current components, routes, data flow, deployment topology\n"
+        f"  - docs/TEST.md             test strategy, mocking patterns, what is already covered\n"
+        f"  - docs/DECISIONS.md        past architectural decisions — respect and follow these\n"
+        f"  - docs/deploy.md           deployment configuration\n"
+        f"  - plan.md                  the implementation plan for this goal\n\n"
         f"Plan summary:\n{state.plan_content[:2000]}"
     )
     executor = ToolExecutor(state.repo_path)
